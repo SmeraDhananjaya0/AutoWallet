@@ -27,3 +27,14 @@ Open http://localhost:5173 (desktop layout, 1280px+).
 | GET | `/transactions` | Transaction list |
 
 Vite proxies these to `http://localhost:8000` when mock mode is off.
+
+## Backend
+
+```bash
+cd backend
+cp .env.example .env   # add ANTHROPIC_API_KEY and STRIPE_SECRET_KEY
+pip install -r requirements.txt
+uvicorn main:app --reload --port 8000
+```
+
+Set `USE_MOCK = false` in `src/api.js` to use the live API.
