@@ -33,7 +33,7 @@ const MOCK_CHAT_RESPONSE = {
 let balanceCents = MOCK_BALANCE_CENTS;
 let transactions = [...MOCK_TRANSACTIONS];
 
-const USE_MOCK = true;
+const USE_MOCK = false;
 
 async function fetchJson(url, options) {
   if (USE_MOCK) return null;

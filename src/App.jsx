@@ -25,12 +25,22 @@ export default function App() {
   const [isSending, setIsSending] = useState(false);
   const [isToppingUp, setIsToppingUp] = useState(false);
 
+  const sortTransactions = (txns) =>
+    [...txns].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+
+  const applyWalletFromResponse = useCallback((data) => {
+    if (typeof data?.balance_cents === 'number') {
+      setBalanceCents(data.balance_cents);
+    }
+    if (Array.isArray(data?.transactions)) {
+      setTransactions(sortTransactions(data.transactions));
+    }
+  }, []);
+
   const refreshWallet = useCallback(async () => {
     const [balance, txns] = await Promise.all([getBalance(), getTransactions()]);
     setBalanceCents(balance.balance_cents);
-    setTransactions(
-      [...txns].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
-    );
+    setTransactions(sortTransactions(txns));
   }, []);
 
   useEffect(() => {
@@ -63,7 +73,7 @@ export default function App() {
         search_results: data.search_results || [],
       };
       setMessages((prev) => [...prev, agentMsg]);
-      await refreshWallet();
+      applyWalletFromResponse(data);
     } catch (err) {
       setMessages((prev) => [
         ...prev,
@@ -84,8 +94,7 @@ export default function App() {
     setIsToppingUp(true);
     try {
       const data = await topUpWallet();
-      setBalanceCents(data.balance_cents);
-      await refreshWallet();
+      applyWalletFromResponse(data);
     } finally {
       setIsToppingUp(false);
     }

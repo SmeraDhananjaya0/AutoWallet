@@ -38,3 +38,18 @@ uvicorn main:app --reload --port 8000
 ```
 
 Set `USE_MOCK = false` in `src/api.js` to use the live API.
+
+## Secrets & API keys
+
+- Copy `backend/.env.example` → `backend/.env` and put real keys **only** in `backend/.env`.
+- `backend/.env` is listed in `.gitignore` (root and `backend/.gitignore`) — **never commit it**.
+- Only placeholder files like `backend/.env.example` belong in git.
+- Keys are loaded via `python-dotenv` in `backend/main.py`; nothing is hardcoded in source.
+- If a key was ever shared or committed by mistake, **rotate it** in the Anthropic and Stripe dashboards immediately.
+
+Verify before pushing:
+
+```bash
+git status   # backend/.env must not appear
+git check-ignore -v backend/.env
+```
