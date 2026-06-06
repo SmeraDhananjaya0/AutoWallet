@@ -3,3 +3,7 @@ uvicorn
 anthropic
 stripe
 python-dotenv
+httpx
+cryptography
+pytest
+PyJWT

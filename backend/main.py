@@ -5,8 +5,15 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 import logging
 import os
+import sys
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -14,12 +21,9 @@ from typing import Any
 
 import anthropic
 import stripe
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-
-load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("autowallet")
@@ -32,10 +36,14 @@ CHARGE_AMOUNT_CENTS = 50  # Stripe minimum for USD
 MAX_TOOL_CALLS_PER_CHAT = 3
 
 state: dict[str, Any] = {
-    "balance_cents": 1000,
+    "balance_usd": 10.0,
     "customer_id": None,
     "transactions": [],
 }
+
+
+def balance_cents() -> int:
+    return round(state["balance_usd"] * 100)
 
 CLAUDE_TOOLS = [
     {
@@ -120,14 +128,14 @@ def create_and_confirm_payment(amount_cents: int) -> stripe.PaymentIntent:
 def record_transaction(
     *,
     reason: str,
-    amount_cents: int,
+    amount_usd: float,
     stripe_charge_id: str,
 ) -> dict[str, Any]:
     txn = {
         "id": new_transaction_id(),
         "timestamp": utc_now_iso(),
         "reason": reason,
-        "amount_cents": amount_cents,
+        "amount_usd": round(amount_usd, 4),
         "stripe_charge_id": stripe_charge_id,
     }
     state["transactions"].insert(0, txn)
@@ -156,44 +164,49 @@ def charge_wallet(
     reason: str,
     *,
     query: str | None = None,
+    amount_usd: float | None = None,
+    amount_cents: int | None = None,
     session: dict[str, Any],
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Always charge exactly 50 cents ($0.50); ignore any amount Claude sends."""
-    amount_cents = CHARGE_AMOUNT_CENTS
+    """Charge the wallet via Stripe. Uses ``amount_usd`` when provided, else ``CHARGE_AMOUNT_CENTS`` ($0.50)."""
+    if amount_usd is None:
+        amount_usd = (amount_cents if amount_cents is not None else CHARGE_AMOUNT_CENTS) / 100
     reason = reason.strip() or "Wallet charge"
+    amount_usd = round(amount_usd, 4)
+    stripe_cents = round(amount_usd * 100)
 
-    if state["balance_cents"] < amount_cents:
+    if state["balance_usd"] < amount_usd:
         session["search_unlocked"] = False
         return (
             "PAYMENT FAILED — STOP. Do not call search_web. Do not fabricate search results. "
-            f"Insufficient balance: have {state['balance_cents']} cents, need {amount_cents} ($0.50). "
+            f"Insufficient balance: have ${state['balance_usd']:.4f}, need ${amount_usd:.4f}. "
             "Tell the user the wallet does not have enough funds.",
             [],
         )
 
     try:
-        intent = create_and_confirm_payment(amount_cents)
+        intent = create_and_confirm_payment(stripe_cents)
     except stripe.StripeError as exc:
         logger.exception("Stripe charge failed for reason=%s", reason)
         session["search_unlocked"] = False
         return format_stripe_error(exc), []
 
     charge_id = stripe_charge_id_from_intent(intent)
-    state["balance_cents"] -= amount_cents
+    state["balance_usd"] -= amount_usd
     record_transaction(
         reason=reason,
-        amount_cents=amount_cents,
+        amount_usd=amount_usd,
         stripe_charge_id=charge_id,
     )
     record = {
         "tool": "charge_wallet",
         "reason": reason,
-        "amount_cents": amount_cents,
+        "amount_usd": amount_usd,
         "stripe_charge_id": charge_id,
     }
     message = (
-        f"Successfully charged $0.50 ({amount_cents} cents) for: {reason}. "
-        f"Remaining balance: {state['balance_cents']} cents."
+        f"Successfully charged ${amount_usd:.4f} for: {reason}. "
+        f"Remaining balance: ${state['balance_usd']:.4f}."
     )
 
     if query and query.strip():
@@ -205,7 +218,7 @@ def charge_wallet(
             {
                 "tool": "search_web",
                 "reason": f"Web search: {query.strip()}",
-                "amount_cents": 0,
+                "amount_usd": 0.0,
                 "stripe_charge_id": charge_id,
             },
         ]
@@ -231,7 +244,7 @@ def search_web(query: str, *, session: dict[str, Any]) -> tuple[str, list[dict[s
         {
             "tool": "search_web",
             "reason": f"Web search: {query}",
-            "amount_cents": 0,
+            "amount_usd": 0.0,
             "stripe_charge_id": "",
         }
     ]
@@ -244,11 +257,88 @@ def run_tool(
     session: dict[str, Any],
 ) -> tuple[str, list[dict[str, Any]]]:
     if name == "charge_wallet":
-        return charge_wallet(
-            str(inputs.get("reason", "")),
-            query=inputs.get("query"),
-            session=session,
+        from complexity_scorer import score_query, score_to_price
+        from payment_router import route_payment
+
+        user_message = str(session.get("user_message", ""))
+        reason = str(inputs.get("reason", "")).strip() or "Wallet charge"
+        query = inputs.get("query")
+
+        score = score_query(user_message)
+        amount_usd = score_to_price(score)
+        payment_result = route_payment(amount_usd, score=score)
+        logger.info(
+            f"Charged {amount_usd:.4f} via {payment_result['rail']} (complexity score: {score})"
         )
+
+        if payment_result.get("status") == "failed":
+            session["search_unlocked"] = False
+            detail = payment_result.get("reason", "Payment failed")
+            return (
+                "PAYMENT FAILED — STOP. Do not call search_web. Do not fabricate search results. "
+                f"{detail} Tell the user the wallet charge failed and you cannot complete the paid search.",
+                [],
+            )
+
+        rail = payment_result.get("rail", "")
+        if rail == "circle":
+            charge_id = payment_result.get("tx_id", "") or f"circle-{payment_result.get('status', 'ok')}"
+            state["balance_usd"] -= amount_usd
+            record_transaction(
+                reason=reason,
+                amount_usd=amount_usd,
+                stripe_charge_id=charge_id,
+            )
+            message = (
+                f"Successfully charged ${amount_usd:.4f} via Circle for: {reason}. "
+                f"Remaining balance: ${state['balance_usd']:.4f}."
+            )
+            record = {
+                "tool": "charge_wallet",
+                "reason": reason,
+                "amount_usd": amount_usd,
+                "stripe_charge_id": charge_id,
+            }
+            if query and str(query).strip():
+                search_text = mock_search_result(str(query).strip())
+                session["search_unlocked"] = False
+                return f"{message}\n\n{search_text}", [
+                    record,
+                    {
+                        "tool": "search_web",
+                        "reason": f"Web search: {str(query).strip()}",
+                        "amount_usd": 0.0,
+                        "stripe_charge_id": charge_id,
+                    },
+                ]
+            session["search_unlocked"] = True
+            return message, [record]
+
+        charge_id = payment_result.get("payment_intent_id", "")
+        message = (
+            f"Successfully charged ${amount_usd:.4f} for: {reason}. "
+            f"Remaining balance: ${state['balance_usd']:.4f}."
+        )
+        record = {
+            "tool": "charge_wallet",
+            "reason": reason,
+            "amount_usd": amount_usd,
+            "stripe_charge_id": charge_id or "",
+        }
+        if query and str(query).strip():
+            search_text = mock_search_result(str(query).strip())
+            session["search_unlocked"] = False
+            return f"{message}\n\n{search_text}", [
+                record,
+                {
+                    "tool": "search_web",
+                    "reason": f"Web search: {str(query).strip()}",
+                    "amount_usd": 0.0,
+                    "stripe_charge_id": charge_id or "",
+                },
+            ]
+        session["search_unlocked"] = True
+        return message, [record]
     if name == "search_web":
         return search_web(str(inputs.get("query", "")), session=session)
     return f"Unknown tool: {name}", []
@@ -299,6 +389,7 @@ def run_claude_loop(user_message: str) -> tuple[str, list[dict[str, Any]]]:
     session: dict[str, Any] = {
         "tool_call_count": 0,
         "search_unlocked": False,
+        "user_message": user_message,
     }
     final_text = ""
     tool_limit_reached = False
@@ -382,23 +473,50 @@ def run_claude_loop(user_message: str) -> tuple[str, list[dict[str, Any]]]:
     return final_text, tool_calls_log
 
 
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PROJECT_ROOT))
+
+from acp_merchant import merchant_router, register_merchant  # noqa: E402
+from spt_handler import spt_router  # noqa: E402
+from x402_middleware import X402PaymentMiddleware  # noqa: E402
+
+_MERCHANT_JSON = _PROJECT_ROOT / "merchant.json"
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     global anthropic_client
 
-    if not stripe.api_key:
-        raise RuntimeError("STRIPE_SECRET_KEY is required (set in .env)")
-    if not ANTHROPIC_API_KEY:
-        raise RuntimeError("ANTHROPIC_API_KEY is required (set in .env)")
+    missing = [v for v in ["STRIPE_SECRET_KEY", "ANTHROPIC_API_KEY"] if not os.getenv(v)]
+    if missing:
+        raise RuntimeError(f"Missing required env vars: {missing}")
+
+    logger.info(f"Circle key loaded: {bool(os.getenv('CIRCLE_API_KEY'))}")
+    logger.info(
+        f"Circle entity secret loaded: {os.getenv('CIRCLE_ENTITY_SECRET', '')[:8]}..."
+    )
 
     customer = stripe.Customer.create(name="AutoWallet Agent")
     state["customer_id"] = customer.id
-    state["balance_cents"] = 1000
+    state["balance_usd"] = 10.0
     state["transactions"] = []
     logger.info("Stripe customer created: %s (balance: $10.00)", customer.id)
 
     anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-    logger.info("AutoWallet API ready")
+
+    result = register_merchant()
+    merchant_id = result.get("id", "local-only")
+
+    print(f"""
+    ╔══════════════════════════════════════╗
+    ║  ACP + Circle Payment Agent Ready    ║
+    ║  Merchant ID : {merchant_id}
+    ║  Endpoint    : {os.getenv('PUBLIC_ENDPOINT_URL', 'http://localhost:8000')}
+    ║  Stripe rail : >= $0.01
+    ║  Circle rail : < $0.01
+    ╚══════════════════════════════════════╝
+    """)
 
     yield
 
@@ -417,6 +535,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(spt_router, prefix="/spt")
+app.include_router(merchant_router, prefix="/merchant")
+app.add_middleware(X402PaymentMiddleware)
 
 
 class ChatRequest(BaseModel):
@@ -461,13 +583,13 @@ def post_chat(body: ChatRequest) -> ChatResponse:
         response=response_text,
         tool_calls=tool_calls,
         transactions=list(state["transactions"]),
-        balance_cents=state["balance_cents"],
+        balance_cents=balance_cents(),
     )
 
 
 @app.get("/wallet/balance", response_model=BalanceResponse)
 def get_balance() -> BalanceResponse:
-    return BalanceResponse(balance_cents=state["balance_cents"])
+    return BalanceResponse(balance_cents=balance_cents())
 
 
 @app.post("/wallet/topup", response_model=TopUpResponse)
@@ -482,14 +604,15 @@ def post_topup() -> TopUpResponse:
         ) from exc
 
     charge_id = stripe_charge_id_from_intent(intent)
-    state["balance_cents"] += amount_cents
+    topup_usd = amount_cents / 100
+    state["balance_usd"] += topup_usd
     record_transaction(
         reason="Wallet top-up",
-        amount_cents=-amount_cents,
+        amount_usd=-topup_usd,
         stripe_charge_id=charge_id,
     )
     return TopUpResponse(
-        balance_cents=state["balance_cents"],
+        balance_cents=balance_cents(),
         transactions=state["transactions"],
     )
 
@@ -497,3 +620,24 @@ def post_topup() -> TopUpResponse:
 @app.get("/transactions")
 def get_transactions() -> list[dict[str, Any]]:
     return state["transactions"]
+
+
+@app.get("/health")
+def get_health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "merchant_registered": _MERCHANT_JSON.exists(),
+        "rails": ["stripe", "circle"],
+        "stripe_configured": bool(os.getenv("STRIPE_SECRET_KEY")),
+        "circle_configured": bool(os.getenv("CIRCLE_API_KEY")),
+        "threshold_usd": 0.01,
+    }
+
+
+class SearchRequest(BaseModel):
+    query: str = ""
+
+
+@app.post("/search")
+def post_search(body: SearchRequest) -> dict[str, Any]:
+    return {"query": body.query, "results": mock_search_result(body.query)}

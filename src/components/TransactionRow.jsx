@@ -1,7 +1,6 @@
-function formatCents(cents) {
-  const abs = Math.abs(cents);
-  const sign = cents > 0 ? '-' : '+';
-  return `${sign}$${(abs / 100).toFixed(2)}`;
+function formatUsd(amountUsd) {
+  const sign = amountUsd > 0 ? '-' : '+';
+  return `${sign}$${Math.abs(amountUsd).toFixed(4)}`;
 }
 
 function formatTime(iso) {
@@ -19,8 +18,8 @@ function truncateId(id, len = 14) {
 }
 
 export default function TransactionRow({ transaction }) {
-  const { timestamp, reason, amount_cents, stripe_charge_id } = transaction;
-  const isCredit = amount_cents < 0;
+  const { timestamp, reason, amount_usd, stripe_charge_id } = transaction;
+  const isCredit = amount_usd < 0;
 
   return (
     <div className="flex items-start justify-between gap-3 border-b border-border py-3 last:border-b-0">
@@ -34,7 +33,7 @@ export default function TransactionRow({ transaction }) {
       <span
         className={`shrink-0 font-mono text-sm font-medium ${isCredit ? 'text-success' : 'text-spend'}`}
       >
-        {formatCents(amount_cents)}
+        {formatUsd(amount_usd)}
       </span>
     </div>
   );

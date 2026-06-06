@@ -4,21 +4,21 @@ const MOCK_TRANSACTIONS = [
     id: 'txn_001',
     timestamp: '2026-06-04T10:15:00Z',
     reason: 'Web search: AI funding rounds',
-    amount_cents: 1,
+    amount_usd: 0.006,
     stripe_charge_id: 'ch_3PxK9m2nQ8vL4wR7',
   },
   {
     id: 'txn_002',
     timestamp: '2026-06-03T18:42:00Z',
     reason: 'Web search: competitor pricing',
-    amount_cents: 1,
+    amount_usd: 0.004,
     stripe_charge_id: 'ch_3PxJ7k1mN5tH2yU6',
   },
   {
     id: 'txn_003',
     timestamp: '2026-06-02T09:00:00Z',
     reason: 'Wallet top-up',
-    amount_cents: -1000,
+    amount_usd: -10.0,
     stripe_charge_id: 'ch_topup_test_001',
   },
 ];
@@ -59,7 +59,7 @@ export async function topUpWallet() {
     id: `txn_${Date.now()}`,
     timestamp: new Date().toISOString(),
     reason: 'Wallet top-up',
-    amount_cents: -1000,
+    amount_usd: -10.0,
     stripe_charge_id: `ch_topup_${Date.now()}`,
   };
   transactions = [txn, ...transactions];
@@ -85,7 +85,7 @@ export async function sendChatMessage(message) {
       id: `txn_${Date.now()}`,
       timestamp: new Date().toISOString(),
       reason: 'Web search: AI funding rounds',
-      amount_cents: 1,
+      amount_usd: 0.006,
       stripe_charge_id: `ch_search_${Date.now().toString(36)}`,
     };
     balanceCents -= 1;
@@ -96,7 +96,7 @@ export async function sendChatMessage(message) {
         {
           tool: 'web_search',
           reason: 'Look up latest AI funding rounds',
-          amount_cents: 1,
+          amount_usd: 0.006,
           stripe_charge_id: searchTxn.stripe_charge_id,
         },
       ],
@@ -133,7 +133,7 @@ export const INITIAL_MESSAGES = [
       {
         tool: 'web_search',
         reason: 'Look up latest AI funding rounds',
-        amount_cents: 1,
+        amount_usd: 0.006,
         stripe_charge_id: 'ch_3PxK9m2nQ8vL4wR7',
       },
     ],
