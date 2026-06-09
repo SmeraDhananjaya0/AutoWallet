@@ -41,6 +41,8 @@ state: dict[str, Any] = {
     "transactions": [],
 }
 
+chat_sessions: dict[str, list[dict[str, Any]]] = {}
+
 
 def balance_cents() -> int:
     return round(state["balance_usd"] * 100)
@@ -250,6 +252,41 @@ def search_web(query: str, *, session: dict[str, Any]) -> tuple[str, list[dict[s
     ]
 
 
+def _charge_wallet_tool_success(
+    *,
+    reason: str,
+    amount_usd: float,
+    charge_id: str,
+    rail_label: str,
+    query: Any,
+    session: dict[str, Any],
+) -> tuple[str, list[dict[str, Any]]]:
+    message = (
+        f"Successfully charged ${amount_usd:.4f} via {rail_label} for: {reason}. "
+        f"Remaining balance: ${state['balance_usd']:.4f}."
+    )
+    record = {
+        "tool": "charge_wallet",
+        "reason": reason,
+        "amount_usd": amount_usd,
+        "stripe_charge_id": charge_id,
+    }
+    if query and str(query).strip():
+        search_text = mock_search_result(str(query).strip())
+        session["search_unlocked"] = False
+        return f"{message}\n\n{search_text}", [
+            record,
+            {
+                "tool": "search_web",
+                "reason": f"Web search: {str(query).strip()}",
+                "amount_usd": 0.0,
+                "stripe_charge_id": charge_id,
+            },
+        ]
+    session["search_unlocked"] = True
+    return message, [record]
+
+
 def run_tool(
     name: str,
     inputs: dict[str, Any],
@@ -257,18 +294,49 @@ def run_tool(
     session: dict[str, Any],
 ) -> tuple[str, list[dict[str, Any]]]:
     if name == "charge_wallet":
-        from complexity_scorer import score_query, score_to_price
+        from complexity_scorer import score_to_price
         from payment_router import route_payment
 
-        user_message = str(session.get("user_message", ""))
         reason = str(inputs.get("reason", "")).strip() or "Wallet charge"
         query = inputs.get("query")
-
-        score = score_query(user_message)
+        rail = str(session.get("payment_rail", ""))
+        score = int(session.get("complexity_score", 1))
         amount_usd = score_to_price(score)
-        payment_result = route_payment(amount_usd, score=score)
+
+        if rail == "stripe":
+            if not session.get("query_paid"):
+                session["search_unlocked"] = False
+                detail = session.get("query_payment_error", "Query payment not completed")
+                return (
+                    "PAYMENT FAILED — STOP. Do not call search_web. Do not fabricate search results. "
+                    f"{detail} Tell the user the wallet charge failed and you cannot complete the paid search.",
+                    [],
+                )
+            charge_id = str(session.get("query_charge_id", ""))
+            logger.info(
+                "Tool charge covered by upfront Stripe payment (score=%s, query_total=$%s)",
+                score,
+                session.get("query_total_cost"),
+            )
+            return _charge_wallet_tool_success(
+                reason=reason,
+                amount_usd=0.0,
+                charge_id=charge_id,
+                rail_label="Stripe",
+                query=query,
+                session=session,
+            )
+
+        payment_result = route_payment(
+            amount_usd,
+            score=score,
+            force_rail="circle",
+        )
         logger.info(
-            f"Charged {amount_usd:.4f} via {payment_result['rail']} (complexity score: {score})"
+            "Charged %s via %s (complexity score: %s)",
+            f"{amount_usd:.4f}",
+            payment_result.get("rail"),
+            score,
         )
 
         if payment_result.get("status") == "failed":
@@ -280,65 +348,21 @@ def run_tool(
                 [],
             )
 
-        rail = payment_result.get("rail", "")
-        if rail == "circle":
-            charge_id = payment_result.get("tx_id", "") or f"circle-{payment_result.get('status', 'ok')}"
-            state["balance_usd"] -= amount_usd
-            record_transaction(
-                reason=reason,
-                amount_usd=amount_usd,
-                stripe_charge_id=charge_id,
-            )
-            message = (
-                f"Successfully charged ${amount_usd:.4f} via Circle for: {reason}. "
-                f"Remaining balance: ${state['balance_usd']:.4f}."
-            )
-            record = {
-                "tool": "charge_wallet",
-                "reason": reason,
-                "amount_usd": amount_usd,
-                "stripe_charge_id": charge_id,
-            }
-            if query and str(query).strip():
-                search_text = mock_search_result(str(query).strip())
-                session["search_unlocked"] = False
-                return f"{message}\n\n{search_text}", [
-                    record,
-                    {
-                        "tool": "search_web",
-                        "reason": f"Web search: {str(query).strip()}",
-                        "amount_usd": 0.0,
-                        "stripe_charge_id": charge_id,
-                    },
-                ]
-            session["search_unlocked"] = True
-            return message, [record]
-
-        charge_id = payment_result.get("payment_intent_id", "")
-        message = (
-            f"Successfully charged ${amount_usd:.4f} for: {reason}. "
-            f"Remaining balance: ${state['balance_usd']:.4f}."
+        charge_id = payment_result.get("tx_id", "") or f"circle-{payment_result.get('status', 'ok')}"
+        state["balance_usd"] -= amount_usd
+        record_transaction(
+            reason=reason,
+            amount_usd=amount_usd,
+            stripe_charge_id=charge_id,
         )
-        record = {
-            "tool": "charge_wallet",
-            "reason": reason,
-            "amount_usd": amount_usd,
-            "stripe_charge_id": charge_id or "",
-        }
-        if query and str(query).strip():
-            search_text = mock_search_result(str(query).strip())
-            session["search_unlocked"] = False
-            return f"{message}\n\n{search_text}", [
-                record,
-                {
-                    "tool": "search_web",
-                    "reason": f"Web search: {str(query).strip()}",
-                    "amount_usd": 0.0,
-                    "stripe_charge_id": charge_id or "",
-                },
-            ]
-        session["search_unlocked"] = True
-        return message, [record]
+        return _charge_wallet_tool_success(
+            reason=reason,
+            amount_usd=amount_usd,
+            charge_id=charge_id,
+            rail_label="Circle",
+            query=query,
+            session=session,
+        )
     if name == "search_web":
         return search_web(str(inputs.get("query", "")), session=session)
     return f"Unknown tool: {name}", []
@@ -379,18 +403,55 @@ def tool_input_dict(raw: Any) -> dict[str, Any]:
     return {}
 
 
-def run_claude_loop(user_message: str) -> tuple[str, list[dict[str, Any]]]:
+def run_claude_loop(
+    user_message: str,
+    conversation_history: list[dict[str, Any]] | None = None,
+) -> tuple[str, list[dict[str, Any]]]:
     if not anthropic_client:
         raise HTTPException(status_code=503, detail="Anthropic client not configured")
 
-    # Fresh conversation per HTTP request — no shared history between /chat calls.
-    messages: list[dict[str, Any]] = [{"role": "user", "content": user_message}]
-    tool_calls_log: list[dict[str, Any]] = []
+    from payment_router import decide_query_rail, init_query_payment
+
+    history = list(conversation_history or [])
+    payment_decision = decide_query_rail(user_message)
+    query_payment = init_query_payment(payment_decision)
+
     session: dict[str, Any] = {
         "tool_call_count": 0,
         "search_unlocked": False,
         "user_message": user_message,
+        "payment_rail": payment_decision["rail"],
+        "complexity_score": payment_decision["score"],
+        "query_total_cost": payment_decision["total_cost_usd"],
+        "query_paid": False,
+        "query_charge_id": "",
+        "query_payment_error": "",
     }
+
+    logger.info(
+        "Query payment decision score=%s total_cost=$%s rail=%s",
+        payment_decision["score"],
+        payment_decision["total_cost_usd"],
+        payment_decision["rail"],
+    )
+
+    if payment_decision["rail"] == "stripe":
+        if query_payment.get("status") == "failed":
+            session["query_payment_error"] = query_payment.get("reason", "Stripe payment failed")
+            return (
+                "Payment failed for this query. "
+                f"{session['query_payment_error']} "
+                "Please try again or top up your wallet.",
+                [],
+            )
+        session["query_paid"] = True
+        session["query_charge_id"] = str(query_payment.get("payment_intent_id", ""))
+
+    messages: list[dict[str, Any]] = [
+        *history,
+        {"role": "user", "content": user_message},
+    ]
+    tool_calls_log: list[dict[str, Any]] = []
     final_text = ""
     tool_limit_reached = False
 
@@ -543,6 +604,7 @@ app.add_middleware(X402PaymentMiddleware)
 
 class ChatRequest(BaseModel):
     message: str
+    session_id: str | None = None
 
 
 class ChatResponse(BaseModel):
@@ -550,6 +612,7 @@ class ChatResponse(BaseModel):
     tool_calls: list[dict[str, Any]]
     transactions: list[dict[str, Any]]
     balance_cents: int
+    session_id: str
 
 
 class BalanceResponse(BaseModel):
@@ -567,8 +630,11 @@ def post_chat(body: ChatRequest) -> ChatResponse:
     if not text:
         raise HTTPException(status_code=400, detail="message is required")
 
+    session_id = body.session_id or str(uuid.uuid4())
+    conversation_history = list(chat_sessions.get(session_id, []))
+
     try:
-        response_text, tool_calls = run_claude_loop(text)
+        response_text, tool_calls = run_claude_loop(text, conversation_history)
     except anthropic.APIError:
         logger.exception("Anthropic API error on /chat")
         raise HTTPException(status_code=502, detail="Claude API request failed") from None
@@ -579,11 +645,16 @@ def post_chat(body: ChatRequest) -> ChatResponse:
         logger.exception("Unhandled error on /chat")
         raise
 
+    conversation_history.append({"role": "user", "content": text})
+    conversation_history.append({"role": "assistant", "content": response_text})
+    chat_sessions[session_id] = conversation_history
+
     return ChatResponse(
         response=response_text,
         tool_calls=tool_calls,
         transactions=list(state["transactions"]),
         balance_cents=balance_cents(),
+        session_id=session_id,
     )
 
 
