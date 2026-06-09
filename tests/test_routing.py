@@ -15,7 +15,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from complexity_scorer import score_query, score_to_price
-from payment_router import route_payment
+from payment_router import decide_query_rail, route_payment
 from x402_middleware import X402PaymentMiddleware
 
 
@@ -50,6 +50,27 @@ def test_score_to_price_rounded_to_four_decimal_places(score: int):
 
 
 # --- payment_router ---
+
+
+def test_decide_query_rail_simple_query_uses_circle():
+    decision = decide_query_rail("hi")
+    assert decision["score"] == 1
+    assert decision["total_cost_usd"] == 0.001
+    assert decision["rail"] == "circle"
+
+
+def test_decide_query_rail_score_10_uses_stripe(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("complexity_scorer.score_query", lambda _q: 10)
+    decision = decide_query_rail("synthetic complex query")
+    assert decision["total_cost_usd"] == 0.01
+    assert decision["rail"] == "stripe"
+
+
+def test_decide_query_rail_score_9_stays_circle(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr("complexity_scorer.score_query", lambda _q: 9)
+    decision = decide_query_rail("synthetic query")
+    assert decision["total_cost_usd"] == 0.009
+    assert decision["rail"] == "circle"
 
 
 @pytest.fixture

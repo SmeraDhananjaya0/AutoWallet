@@ -24,6 +24,31 @@ logger = logging.getLogger("autowallet.payment_router")
 ROUTING_THRESHOLD_USD = 0.01
 
 
+def decide_query_rail(user_message: str) -> dict[str, Any]:
+    """Score the query once and pick Stripe vs Circle from total estimated cost."""
+    from complexity_scorer import score_query, score_to_price
+
+    score = score_query(user_message)
+    total_cost = score_to_price(score)
+    rail = "stripe" if total_cost >= ROUTING_THRESHOLD_USD else "circle"
+    return {
+        "score": score,
+        "total_cost_usd": total_cost,
+        "rail": rail,
+    }
+
+
+def init_query_payment(decision: dict[str, Any]) -> dict[str, Any]:
+    """Charge the full query upfront on Stripe; Circle charges per tool call."""
+    if decision["rail"] == "circle":
+        return {
+            "rail": "circle",
+            "amount_usd": decision["total_cost_usd"],
+            "status": "deferred",
+        }
+    return _route_stripe(decision["total_cost_usd"])
+
+
 def _circle_api_base() -> str:
     override = os.getenv("CIRCLE_API_BASE_URL", "").strip()
     if override:
@@ -146,9 +171,14 @@ def route_payment(
     recipient_address: str | None = None,
     *,
     score: int | None = None,
+    force_rail: str | None = None,
 ) -> dict[str, Any]:
     """Route a payment to Circle (micropayments) or Stripe (>= $0.01)."""
-    if amount_usd < ROUTING_THRESHOLD_USD:
+    if force_rail == "circle":
+        result = _route_circle(amount_usd, recipient_address)
+    elif force_rail == "stripe":
+        result = _route_stripe(amount_usd)
+    elif amount_usd < ROUTING_THRESHOLD_USD:
         result = _route_circle(amount_usd, recipient_address)
     else:
         result = _route_stripe(amount_usd)

@@ -72,10 +72,13 @@ export async function getTransactions() {
   return [...transactions];
 }
 
-export async function sendChatMessage(message) {
+export async function sendChatMessage(message, sessionId = null) {
   const data = await fetchJson('/chat', {
     method: 'POST',
-    body: JSON.stringify({ message }),
+    body: JSON.stringify({
+      message,
+      ...(sessionId ? { session_id: sessionId } : {}),
+    }),
   });
   if (data) return data;
 

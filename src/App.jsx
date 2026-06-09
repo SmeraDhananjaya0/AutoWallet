@@ -24,6 +24,7 @@ export default function App() {
   const [inputValue, setInputValue] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [isToppingUp, setIsToppingUp] = useState(false);
+  const [sessionId, setSessionId] = useState(null);
 
   const sortTransactions = (txns) =>
     [...txns].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
@@ -58,7 +59,10 @@ export default function App() {
     setAgentStatus('thinking');
 
     try {
-      const data = await sendChatMessage(text);
+      const data = await sendChatMessage(text, sessionId);
+      if (data.session_id) {
+        setSessionId(data.session_id);
+      }
 
       if (data.tool_calls?.length) {
         setAgentStatus('spending');
