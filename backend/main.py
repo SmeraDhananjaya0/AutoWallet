@@ -31,6 +31,8 @@ logger = logging.getLogger("autowallet")
 stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
+ANTHROPIC_MAX_RETRIES = 5
+ANTHROPIC_TIMEOUT_SECONDS = 90.0
 TEST_PAYMENT_METHOD = "pm_card_visa"
 CHARGE_AMOUNT_CENTS = 50  # Stripe minimum for USD
 MAX_TOOL_CALLS_PER_CHAT = 3
@@ -564,7 +566,16 @@ async def lifespan(_app: FastAPI):
     state["transactions"] = []
     logger.info("Stripe customer created: %s (balance: $10.00)", customer.id)
 
-    anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+    anthropic_client = anthropic.Anthropic(
+        api_key=ANTHROPIC_API_KEY,
+        max_retries=ANTHROPIC_MAX_RETRIES,
+        timeout=ANTHROPIC_TIMEOUT_SECONDS,
+    )
+    logger.info(
+        "Anthropic client configured (max_retries=%s, timeout=%ss)",
+        ANTHROPIC_MAX_RETRIES,
+        ANTHROPIC_TIMEOUT_SECONDS,
+    )
 
     result = register_merchant()
     merchant_id = result.get("id", "local-only")
