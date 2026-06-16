@@ -254,6 +254,86 @@ def search_web(query: str, *, session: dict[str, Any]) -> tuple[str, list[dict[s
     ]
 
 
+def _patch_pending_charge_ids(tool_calls_log: list[dict[str, Any]], charge_id: str) -> None:
+    for record in tool_calls_log:
+        if record.get("stripe_charge_id") == "pending":
+            record["stripe_charge_id"] = charge_id
+
+
+def _settle_pending_charges(
+    payment_decision: dict[str, Any],
+    pending_charges: list[dict[str, Any]],
+    session: dict[str, Any],
+    tool_calls_log: list[dict[str, Any]],
+) -> str | None:
+    """Execute queued charges after a successful agent loop. Returns error text on failure."""
+    if not pending_charges:
+        return None
+
+    from payment_router import init_query_payment, route_payment
+
+    rail = payment_decision["rail"]
+
+    try:
+        if rail == "stripe":
+            total_cost = payment_decision["total_cost_usd"]
+            if state["balance_usd"] < total_cost:
+                return (
+                    f"Insufficient balance: have ${state['balance_usd']:.4f}, "
+                    f"need ${total_cost:.4f}"
+                )
+            result = init_query_payment(payment_decision)
+            if result.get("status") == "failed":
+                return str(result.get("reason", "Stripe payment failed"))
+            charge_id = str(result.get("payment_intent_id", ""))
+            session["query_paid"] = True
+            session["query_charge_id"] = charge_id
+            _patch_pending_charge_ids(tool_calls_log, charge_id)
+            return None
+
+        for charge in pending_charges:
+            amount_usd = charge["amount_usd"]
+            if state["balance_usd"] < amount_usd:
+                return (
+                    f"Insufficient balance: have ${state['balance_usd']:.4f}, "
+                    f"need ${amount_usd:.4f}"
+                )
+            result = route_payment(
+                amount_usd,
+                score=charge.get("score"),
+                force_rail="circle",
+            )
+            if result.get("status") in ("failed", "skipped"):
+                return str(result.get("reason", "Circle payment failed"))
+            charge_id = result.get("tx_id", "") or f"circle-{result.get('status', 'ok')}"
+            state["balance_usd"] -= amount_usd
+            record_transaction(
+                reason=charge["reason"],
+                amount_usd=amount_usd,
+                stripe_charge_id=charge_id,
+            )
+            for record in tool_calls_log:
+                if (
+                    record.get("tool") == "charge_wallet"
+                    and record.get("reason") == charge["reason"]
+                    and record.get("stripe_charge_id") == "pending"
+                ):
+                    record["stripe_charge_id"] = charge_id
+                    break
+            for record in tool_calls_log:
+                if (
+                    record.get("tool") == "search_web"
+                    and record.get("stripe_charge_id") == "pending"
+                    and charge.get("query")
+                    and charge["query"] in record.get("reason", "")
+                ):
+                    record["stripe_charge_id"] = charge_id
+        return None
+    except Exception as exc:
+        logger.exception("Billing settlement failed")
+        return str(exc)
+
+
 def _charge_wallet_tool_success(
     *,
     reason: str,
@@ -297,7 +377,6 @@ def run_tool(
 ) -> tuple[str, list[dict[str, Any]]]:
     if name == "charge_wallet":
         from complexity_scorer import score_to_price
-        from payment_router import route_payment
 
         reason = str(inputs.get("reason", "")).strip() or "Wallet charge"
         query = inputs.get("query")
@@ -305,63 +384,26 @@ def run_tool(
         score = int(session.get("complexity_score", 1))
         amount_usd = score_to_price(score)
 
-        if rail == "stripe":
-            if not session.get("query_paid"):
-                session["search_unlocked"] = False
-                detail = session.get("query_payment_error", "Query payment not completed")
-                return (
-                    "PAYMENT FAILED — STOP. Do not call search_web. Do not fabricate search results. "
-                    f"{detail} Tell the user the wallet charge failed and you cannot complete the paid search.",
-                    [],
-                )
-            charge_id = str(session.get("query_charge_id", ""))
-            logger.info(
-                "Tool charge covered by upfront Stripe payment (score=%s, query_total=$%s)",
-                score,
-                session.get("query_total_cost"),
-            )
-            return _charge_wallet_tool_success(
-                reason=reason,
-                amount_usd=0.0,
-                charge_id=charge_id,
-                rail_label="Stripe",
-                query=query,
-                session=session,
-            )
-
-        payment_result = route_payment(
-            amount_usd,
-            score=score,
-            force_rail="circle",
+        session["pending_charges"].append(
+            {
+                "reason": reason,
+                "amount_usd": amount_usd,
+                "score": score,
+                "query": query,
+            }
         )
+        rail_label = "Stripe" if rail == "stripe" else "Circle"
         logger.info(
-            "Charged %s via %s (complexity score: %s)",
+            "Queued %s charge of $%s (score=%s); settlement after agent loop",
+            rail_label,
             f"{amount_usd:.4f}",
-            payment_result.get("rail"),
             score,
-        )
-
-        if payment_result.get("status") == "failed":
-            session["search_unlocked"] = False
-            detail = payment_result.get("reason", "Payment failed")
-            return (
-                "PAYMENT FAILED — STOP. Do not call search_web. Do not fabricate search results. "
-                f"{detail} Tell the user the wallet charge failed and you cannot complete the paid search.",
-                [],
-            )
-
-        charge_id = payment_result.get("tx_id", "") or f"circle-{payment_result.get('status', 'ok')}"
-        state["balance_usd"] -= amount_usd
-        record_transaction(
-            reason=reason,
-            amount_usd=amount_usd,
-            stripe_charge_id=charge_id,
         )
         return _charge_wallet_tool_success(
             reason=reason,
             amount_usd=amount_usd,
-            charge_id=charge_id,
-            rail_label="Circle",
+            charge_id="pending",
+            rail_label=rail_label,
             query=query,
             session=session,
         )
@@ -408,15 +450,15 @@ def tool_input_dict(raw: Any) -> dict[str, Any]:
 def run_claude_loop(
     user_message: str,
     conversation_history: list[dict[str, Any]] | None = None,
-) -> tuple[str, list[dict[str, Any]]]:
+) -> tuple[str, list[dict[str, Any]], str | None]:
     if not anthropic_client:
         raise HTTPException(status_code=503, detail="Anthropic client not configured")
 
-    from payment_router import decide_query_rail, init_query_payment
+    from payment_router import decide_query_rail
 
     history = list(conversation_history or [])
     payment_decision = decide_query_rail(user_message)
-    query_payment = init_query_payment(payment_decision)
+    pending_charges: list[dict[str, Any]] = []
 
     session: dict[str, Any] = {
         "tool_call_count": 0,
@@ -425,9 +467,7 @@ def run_claude_loop(
         "payment_rail": payment_decision["rail"],
         "complexity_score": payment_decision["score"],
         "query_total_cost": payment_decision["total_cost_usd"],
-        "query_paid": False,
-        "query_charge_id": "",
-        "query_payment_error": "",
+        "pending_charges": pending_charges,
     }
 
     logger.info(
@@ -436,18 +476,6 @@ def run_claude_loop(
         payment_decision["total_cost_usd"],
         payment_decision["rail"],
     )
-
-    if payment_decision["rail"] == "stripe":
-        if query_payment.get("status") == "failed":
-            session["query_payment_error"] = query_payment.get("reason", "Stripe payment failed")
-            return (
-                "Payment failed for this query. "
-                f"{session['query_payment_error']} "
-                "Please try again or top up your wallet.",
-                [],
-            )
-        session["query_paid"] = True
-        session["query_charge_id"] = str(query_payment.get("payment_intent_id", ""))
 
     messages: list[dict[str, Any]] = [
         *history,
@@ -533,7 +561,13 @@ def run_claude_loop(
     if not final_text:
         final_text = "Task completed."
 
-    return final_text, tool_calls_log
+    billing_error = _settle_pending_charges(
+        payment_decision,
+        pending_charges,
+        session,
+        tool_calls_log,
+    )
+    return final_text, tool_calls_log, billing_error
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -624,6 +658,7 @@ class ChatResponse(BaseModel):
     transactions: list[dict[str, Any]]
     balance_cents: int
     session_id: str
+    billing_error: str | None = None
 
 
 class BalanceResponse(BaseModel):
@@ -645,16 +680,29 @@ def post_chat(body: ChatRequest) -> ChatResponse:
     conversation_history = list(chat_sessions.get(session_id, []))
 
     try:
-        response_text, tool_calls = run_claude_loop(text, conversation_history)
-    except anthropic.APIError:
+        response_text, tool_calls, billing_error = run_claude_loop(text, conversation_history)
+    except anthropic.APIError as exc:
         logger.exception("Anthropic API error on /chat")
-        raise HTTPException(status_code=502, detail="Claude API request failed") from None
+        status = getattr(exc, "status_code", None) or 502
+        message = getattr(exc, "message", None)
+        if not message:
+            body = getattr(exc, "body", None)
+            if isinstance(body, dict):
+                message = body.get("error", {}).get("message")
+        message = message or str(exc)
+        raise HTTPException(
+            status_code=502 if status >= 500 else 400,
+            detail=f"Claude API error ({status}): {message}",
+        ) from None
     except stripe.StripeError:
         logger.exception("Stripe error on /chat")
         raise HTTPException(status_code=502, detail="Payment processing failed") from None
     except Exception:
         logger.exception("Unhandled error on /chat")
         raise
+
+    if billing_error:
+        logger.error("Billing settlement failed after successful agent loop: %s", billing_error)
 
     conversation_history.append({"role": "user", "content": text})
     conversation_history.append({"role": "assistant", "content": response_text})
@@ -666,6 +714,7 @@ def post_chat(body: ChatRequest) -> ChatResponse:
         transactions=list(state["transactions"]),
         balance_cents=balance_cents(),
         session_id=session_id,
+        billing_error=billing_error,
     )
 
 
