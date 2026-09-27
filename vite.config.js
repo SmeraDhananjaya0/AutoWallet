@@ -9,6 +9,8 @@ export default defineConfig({
       '/chat': 'http://localhost:8000',
       '/wallet': 'http://localhost:8000',
       '/transactions': 'http://localhost:8000',
+      '/demo': 'http://localhost:8000',
+      '/health': 'http://localhost:8000',
     },
   },
 });
