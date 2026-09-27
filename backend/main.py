@@ -1,650 +1,129 @@
-# conda activate base (or your env)
-# pip install -r requirements.txt
-# create .env from .env.example and fill in keys
-# uvicorn main:app --reload --port 8000
+"""AutoWallet API.
+
+Run from the repository root (so there is exactly one copy of every module):
+
+    pip install -r backend/requirements.txt
+    uvicorn backend.main:app --reload --port 8000
+"""
 
 from __future__ import annotations
 
-from pathlib import Path
-
-from dotenv import load_dotenv
-
-load_dotenv(Path(__file__).resolve().parent / ".env")
-
 import logging
-import os
-import sys
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any
 
 import anthropic
-import stripe
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
+
+from backend.acp import merchant_router
+from backend.agent import Agent, make_client
+from backend.config import Settings, get_settings
+from backend.ledger import Ledger, micros_to_usd, usd_to_micros
+from backend.rails import CircleRail, RobinhoodChainRail, StripeRail
+from backend.router import PaymentRouter
+from backend.search import search
+from backend.spt import SptIssuer, spt_router
+from backend.treasury import AutoTopUp, RobinhoodCryptoClient, SimulatedRobinhoodCrypto
+from backend.x402 import PaymentReceipt, ReplayGuard, require_payment
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("autowallet")
 
-stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-5")
-ANTHROPIC_MAX_RETRIES = 5
-ANTHROPIC_TIMEOUT_SECONDS = 90.0
-TEST_PAYMENT_METHOD = "pm_card_visa"
-CHARGE_AMOUNT_CENTS = 50  # Stripe minimum for USD
-MAX_TOOL_CALLS_PER_CHAT = 3
 
-state: dict[str, Any] = {
-    "balance_usd": 10.0,
-    "customer_id": None,
-    "transactions": [],
-}
-
-chat_sessions: dict[str, list[dict[str, Any]]] = {}
+@dataclass
+class Services:
+    settings: Settings
+    ledger: Ledger
+    router: PaymentRouter
+    topup: AutoTopUp
+    spt: SptIssuer
+    replay_guard: ReplayGuard
+    agent: Agent | None
+    chat_sessions: dict[str, list[dict[str, Any]]]
 
 
-def balance_cents() -> int:
-    return round(state["balance_usd"] * 100)
+def build_services(settings: Settings, *, anthropic_client: Any = None, setup_stripe: bool = True) -> Services:
+    ledger = Ledger(usd_to_micros(settings.initial_balance_usd), db_path=settings.ledger_db_path or None)
 
-CLAUDE_TOOLS = [
-    {
-        "name": "charge_wallet",
-        "description": (
-            "Charge the wallet exactly $0.50 (50 cents) before a paid action. "
-            "For web search, pass query to charge and search in one step."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "reason": {
-                    "type": "string",
-                    "description": "Human-readable reason for the charge",
-                },
-                "query": {
-                    "type": "string",
-                    "description": "Optional search query; if set, runs search after charging",
-                },
-            },
-            "required": ["reason"],
-        },
-    },
-    {
-        "name": "search_web",
-        "description": (
-            "Search the web after charge_wallet succeeded in this request. "
-            "Costs $0.50 per call (paid via charge_wallet). Does not charge again."
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "Search query",
-                },
-            },
-            "required": ["query"],
-        },
-    },
-]
+    stripe_rail = StripeRail(settings)
+    if setup_stripe:
+        stripe_rail.setup()
+    chain = RobinhoodChainRail(settings)
+    circle = CircleRail(settings)
 
-SYSTEM_PROMPT = """You are AutoWallet, an AI agent with a wallet. To search the web, you must call charge_wallet, then call search_web. Each search costs $0.50 (50 cents) via charge_wallet — never more than $0.50 per search. Never call charge_wallet more than 3 times per request. Always complete the search only after a successful charge.
-
-If a tool returns PAYMENT FAILED, do not call search_web, do not invent search results, and tell the user the charge failed.
-
-For research tasks: first call charge_wallet (reason describing the search). Then call search_web with the query. You may pass query on charge_wallet to charge and search in one step. Summarize results for the user when done."""
-
-anthropic_client: anthropic.Anthropic | None = None
-
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def new_transaction_id() -> str:
-    return f"txn_{uuid.uuid4().hex[:12]}"
-
-
-def stripe_charge_id_from_intent(intent: stripe.PaymentIntent) -> str:
-    charge = intent.latest_charge
-    if charge is None:
-        return intent.id
-    if isinstance(charge, str):
-        return charge
-    return getattr(charge, "id", str(charge))
-
-
-def create_and_confirm_payment(amount_cents: int) -> stripe.PaymentIntent:
-    if not state["customer_id"]:
-        raise HTTPException(status_code=503, detail="Stripe customer not initialized")
-    return stripe.PaymentIntent.create(
-        amount=amount_cents,
-        currency="usd",
-        customer=state["customer_id"],
-        payment_method=TEST_PAYMENT_METHOD,
-        confirm=True,
-        off_session=True,
-    )
-
-
-def record_transaction(
-    *,
-    reason: str,
-    amount_usd: float,
-    stripe_charge_id: str,
-) -> dict[str, Any]:
-    txn = {
-        "id": new_transaction_id(),
-        "timestamp": utc_now_iso(),
-        "reason": reason,
-        "amount_usd": round(amount_usd, 4),
-        "stripe_charge_id": stripe_charge_id,
-    }
-    state["transactions"].insert(0, txn)
-    return txn
-
-
-def format_stripe_error(exc: stripe.StripeError) -> str:
-    detail = getattr(exc, "user_message", None) or str(exc)
-    code = getattr(exc, "code", None)
-    code_part = f" (code: {code})" if code else ""
-    return (
-        "PAYMENT FAILED — STOP. Do not call search_web. Do not fabricate or guess search results. "
-        f"Stripe rejected the $0.50 charge{code_part}: {detail}. "
-        "Tell the user the wallet charge failed and you cannot complete the paid search."
-    )
-
-
-def mock_search_result(query: str) -> str:
-    return (
-        f"Mock search results for '{query}': Several relevant results found "
-        "including recent news, analysis, and data points related to the topic."
-    )
-
-
-def charge_wallet(
-    reason: str,
-    *,
-    query: str | None = None,
-    amount_usd: float | None = None,
-    amount_cents: int | None = None,
-    session: dict[str, Any],
-) -> tuple[str, list[dict[str, Any]]]:
-    """Charge the wallet via Stripe. Uses ``amount_usd`` when provided, else ``CHARGE_AMOUNT_CENTS`` ($0.50)."""
-    if amount_usd is None:
-        amount_usd = (amount_cents if amount_cents is not None else CHARGE_AMOUNT_CENTS) / 100
-    reason = reason.strip() or "Wallet charge"
-    amount_usd = round(amount_usd, 4)
-    stripe_cents = round(amount_usd * 100)
-
-    if state["balance_usd"] < amount_usd:
-        session["search_unlocked"] = False
-        return (
-            "PAYMENT FAILED — STOP. Do not call search_web. Do not fabricate search results. "
-            f"Insufficient balance: have ${state['balance_usd']:.4f}, need ${amount_usd:.4f}. "
-            "Tell the user the wallet does not have enough funds.",
-            [],
+    if settings.crypto_mode == "live":
+        crypto = RobinhoodCryptoClient(
+            settings.crypto_api_key, settings.crypto_private_key_b64, settings.crypto_base_url
         )
+    else:
+        crypto = SimulatedRobinhoodCrypto()
 
-    try:
-        intent = create_and_confirm_payment(stripe_cents)
-    except stripe.StripeError as exc:
-        logger.exception("Stripe charge failed for reason=%s", reason)
-        session["search_unlocked"] = False
-        return format_stripe_error(exc), []
-
-    charge_id = stripe_charge_id_from_intent(intent)
-    state["balance_usd"] -= amount_usd
-    record_transaction(
-        reason=reason,
-        amount_usd=amount_usd,
-        stripe_charge_id=charge_id,
-    )
-    record = {
-        "tool": "charge_wallet",
-        "reason": reason,
-        "amount_usd": amount_usd,
-        "stripe_charge_id": charge_id,
-    }
-    message = (
-        f"Successfully charged ${amount_usd:.4f} for: {reason}. "
-        f"Remaining balance: ${state['balance_usd']:.4f}."
+    topup = AutoTopUp(settings, ledger, crypto, chain)
+    router = PaymentRouter(
+        ledger,
+        stripe=stripe_rail,
+        chain=chain,
+        circle=circle,
+        micropayment_rail=settings.micropayment_rail,
+        topup=topup,
     )
 
-    if query and query.strip():
-        search_text = mock_search_result(query.strip())
-        session["search_unlocked"] = False
-        message = f"{message}\n\n{search_text}"
-        return message, [
-            record,
-            {
-                "tool": "search_web",
-                "reason": f"Web search: {query.strip()}",
-                "amount_usd": 0.0,
-                "stripe_charge_id": charge_id,
-            },
-        ]
+    client = anthropic_client if anthropic_client is not None else make_client(settings)
+    agent = Agent(settings, router, client) if client is not None else None
 
-    session["search_unlocked"] = True
-    return message, [record]
-
-
-def search_web(query: str, *, session: dict[str, Any]) -> tuple[str, list[dict[str, Any]]]:
-    query = query.strip()
-    if not query:
-        return "query is required.", []
-
-    if not session.get("search_unlocked"):
-        return (
-            "Error: call charge_wallet before search_web. "
-            "Each search costs $0.50 via charge_wallet first.",
-            [],
-        )
-
-    session["search_unlocked"] = False
-    return mock_search_result(query), [
-        {
-            "tool": "search_web",
-            "reason": f"Web search: {query}",
-            "amount_usd": 0.0,
-            "stripe_charge_id": "",
-        }
-    ]
-
-
-def _patch_pending_charge_ids(tool_calls_log: list[dict[str, Any]], charge_id: str) -> None:
-    for record in tool_calls_log:
-        if record.get("stripe_charge_id") == "pending":
-            record["stripe_charge_id"] = charge_id
-
-
-def _settle_pending_charges(
-    payment_decision: dict[str, Any],
-    pending_charges: list[dict[str, Any]],
-    session: dict[str, Any],
-    tool_calls_log: list[dict[str, Any]],
-) -> str | None:
-    """Execute queued charges after a successful agent loop. Returns error text on failure."""
-    if not pending_charges:
-        return None
-
-    from payment_router import init_query_payment, route_payment
-
-    rail = payment_decision["rail"]
-
-    try:
-        if rail == "stripe":
-            total_cost = payment_decision["total_cost_usd"]
-            if state["balance_usd"] < total_cost:
-                return (
-                    f"Insufficient balance: have ${state['balance_usd']:.4f}, "
-                    f"need ${total_cost:.4f}"
-                )
-            result = init_query_payment(payment_decision)
-            if result.get("status") == "failed":
-                return str(result.get("reason", "Stripe payment failed"))
-            charge_id = str(result.get("payment_intent_id", ""))
-            session["query_paid"] = True
-            session["query_charge_id"] = charge_id
-            _patch_pending_charge_ids(tool_calls_log, charge_id)
-            return None
-
-        for charge in pending_charges:
-            amount_usd = charge["amount_usd"]
-            if state["balance_usd"] < amount_usd:
-                return (
-                    f"Insufficient balance: have ${state['balance_usd']:.4f}, "
-                    f"need ${amount_usd:.4f}"
-                )
-            result = route_payment(
-                amount_usd,
-                score=charge.get("score"),
-                force_rail="circle",
-            )
-            if result.get("status") in ("failed", "skipped"):
-                return str(result.get("reason", "Circle payment failed"))
-            charge_id = result.get("tx_id", "") or f"circle-{result.get('status', 'ok')}"
-            state["balance_usd"] -= amount_usd
-            record_transaction(
-                reason=charge["reason"],
-                amount_usd=amount_usd,
-                stripe_charge_id=charge_id,
-            )
-            for record in tool_calls_log:
-                if (
-                    record.get("tool") == "charge_wallet"
-                    and record.get("reason") == charge["reason"]
-                    and record.get("stripe_charge_id") == "pending"
-                ):
-                    record["stripe_charge_id"] = charge_id
-                    break
-            for record in tool_calls_log:
-                if (
-                    record.get("tool") == "search_web"
-                    and record.get("stripe_charge_id") == "pending"
-                    and charge.get("query")
-                    and charge["query"] in record.get("reason", "")
-                ):
-                    record["stripe_charge_id"] = charge_id
-        return None
-    except Exception as exc:
-        logger.exception("Billing settlement failed")
-        return str(exc)
-
-
-def _charge_wallet_tool_success(
-    *,
-    reason: str,
-    amount_usd: float,
-    charge_id: str,
-    rail_label: str,
-    query: Any,
-    session: dict[str, Any],
-) -> tuple[str, list[dict[str, Any]]]:
-    message = (
-        f"Successfully charged ${amount_usd:.4f} via {rail_label} for: {reason}. "
-        f"Remaining balance: ${state['balance_usd']:.4f}."
+    return Services(
+        settings=settings,
+        ledger=ledger,
+        router=router,
+        topup=topup,
+        spt=SptIssuer(settings.spt_signing_secret, settings.spt_max_amount_usd),
+        replay_guard=ReplayGuard(),
+        agent=agent,
+        chat_sessions={},
     )
-    record = {
-        "tool": "charge_wallet",
-        "reason": reason,
-        "amount_usd": amount_usd,
-        "stripe_charge_id": charge_id,
-    }
-    if query and str(query).strip():
-        search_text = mock_search_result(str(query).strip())
-        session["search_unlocked"] = False
-        return f"{message}\n\n{search_text}", [
-            record,
-            {
-                "tool": "search_web",
-                "reason": f"Web search: {str(query).strip()}",
-                "amount_usd": 0.0,
-                "stripe_charge_id": charge_id,
-            },
-        ]
-    session["search_unlocked"] = True
-    return message, [record]
 
 
-def run_tool(
-    name: str,
-    inputs: dict[str, Any],
-    *,
-    session: dict[str, Any],
-) -> tuple[str, list[dict[str, Any]]]:
-    if name == "charge_wallet":
-        from complexity_scorer import score_to_price
-
-        reason = str(inputs.get("reason", "")).strip() or "Wallet charge"
-        query = inputs.get("query")
-        rail = str(session.get("payment_rail", ""))
-        score = int(session.get("complexity_score", 1))
-        amount_usd = score_to_price(score)
-
-        session["pending_charges"].append(
-            {
-                "reason": reason,
-                "amount_usd": amount_usd,
-                "score": score,
-                "query": query,
-            }
-        )
-        rail_label = "Stripe" if rail == "stripe" else "Circle"
+def create_app(services: Services | None = None) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        if getattr(app.state, "services", None) is None:
+            app.state.services = build_services(get_settings())
+        svc: Services = app.state.services
+        s = svc.settings
         logger.info(
-            "Queued %s charge of $%s (score=%s); settlement after agent loop",
-            rail_label,
-            f"{amount_usd:.4f}",
-            score,
+            "AutoWallet ready | balance $%.2f | chain=%s (%s) | robinhood=%s | stripe=%s | circle=%s | claude=%s",
+            micros_to_usd(svc.ledger.balance_micros),
+            s.chain_mode,
+            s.chain_id,
+            s.crypto_mode,
+            svc.router.stripe.available()[1],
+            svc.router.circle.available()[1],
+            s.claude_model if svc.agent else "not configured",
         )
-        return _charge_wallet_tool_success(
-            reason=reason,
-            amount_usd=amount_usd,
-            charge_id="pending",
-            rail_label=rail_label,
-            query=query,
-            session=session,
-        )
-    if name == "search_web":
-        return search_web(str(inputs.get("query", "")), session=session)
-    return f"Unknown tool: {name}", []
+        yield
 
-
-def extract_text(content: list[Any]) -> str:
-    parts: list[str] = []
-    for block in content:
-        if getattr(block, "type", None) == "text":
-            parts.append(block.text)
-    return "\n".join(parts).strip()
-
-
-def serialize_assistant_content(content: list[Any]) -> list[dict[str, Any]]:
-    """Plain dicts for the next Messages API turn (avoids SDK object serialization issues)."""
-    serialized: list[dict[str, Any]] = []
-    for block in content:
-        block_type = getattr(block, "type", None)
-        if block_type == "text":
-            serialized.append({"type": "text", "text": block.text})
-        elif block_type == "tool_use":
-            serialized.append(
-                {
-                    "type": "tool_use",
-                    "id": block.id,
-                    "name": block.name,
-                    "input": block.input,
-                }
-            )
-    return serialized
-
-
-def tool_input_dict(raw: Any) -> dict[str, Any]:
-    if isinstance(raw, dict):
-        return raw
-    if hasattr(raw, "model_dump"):
-        return raw.model_dump()
-    return {}
-
-
-def run_claude_loop(
-    user_message: str,
-    conversation_history: list[dict[str, Any]] | None = None,
-) -> tuple[str, list[dict[str, Any]], str | None]:
-    if not anthropic_client:
-        raise HTTPException(status_code=503, detail="Anthropic client not configured")
-
-    from payment_router import decide_query_rail
-
-    history = list(conversation_history or [])
-    payment_decision = decide_query_rail(user_message)
-    pending_charges: list[dict[str, Any]] = []
-
-    session: dict[str, Any] = {
-        "tool_call_count": 0,
-        "search_unlocked": False,
-        "user_message": user_message,
-        "payment_rail": payment_decision["rail"],
-        "complexity_score": payment_decision["score"],
-        "query_total_cost": payment_decision["total_cost_usd"],
-        "pending_charges": pending_charges,
-    }
-
-    logger.info(
-        "Query payment decision score=%s total_cost=$%s rail=%s",
-        payment_decision["score"],
-        payment_decision["total_cost_usd"],
-        payment_decision["rail"],
+    app = FastAPI(title="AutoWallet API", lifespan=lifespan)
+    app.state.services = services
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["http://localhost:5173", "http://localhost:5174"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
-
-    messages: list[dict[str, Any]] = [
-        *history,
-        {"role": "user", "content": user_message},
-    ]
-    tool_calls_log: list[dict[str, Any]] = []
-    final_text = ""
-    tool_limit_reached = False
-
-    while True:
-        logger.info(
-            "Claude request (tool_calls=%d, messages=%d)",
-            session["tool_call_count"],
-            len(messages),
-        )
-        response = anthropic_client.messages.create(
-            model=CLAUDE_MODEL,
-            max_tokens=2048,
-            system=SYSTEM_PROMPT,
-            tools=CLAUDE_TOOLS,
-            messages=messages,
-        )
-
-        messages.append(
-            {"role": "assistant", "content": serialize_assistant_content(response.content)}
-        )
-
-        if response.stop_reason == "end_turn":
-            final_text = extract_text(response.content)
-            break
-
-        if response.stop_reason != "tool_use":
-            final_text = extract_text(response.content) or "No response from agent."
-            break
-
-        tool_result_blocks: list[dict[str, Any]] = []
-        for block in response.content:
-            if getattr(block, "type", None) != "tool_use":
-                continue
-
-            if session["tool_call_count"] >= MAX_TOOL_CALLS_PER_CHAT:
-                tool_limit_reached = True
-                tool_result_blocks.append(
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": block.id,
-                        "content": (
-                            f"Maximum {MAX_TOOL_CALLS_PER_CHAT} tool calls per request reached. "
-                            "Respond to the user with what you have."
-                        ),
-                    }
-                )
-                continue
-
-            session["tool_call_count"] += 1
-            result_text, records = run_tool(
-                block.name,
-                tool_input_dict(block.input),
-                session=session,
-            )
-            tool_calls_log.extend(records)
-            tool_result_blocks.append(
-                {
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": result_text,
-                }
-            )
-
-        messages.append({"role": "user", "content": tool_result_blocks})
-
-        if tool_limit_reached:
-            follow_up = anthropic_client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=2048,
-                system=SYSTEM_PROMPT,
-                tools=CLAUDE_TOOLS,
-                messages=messages,
-            )
-            final_text = extract_text(follow_up.content) or "Task completed (tool limit reached)."
-            break
-
-    if not final_text:
-        final_text = "Task completed."
-
-    billing_error = _settle_pending_charges(
-        payment_decision,
-        pending_charges,
-        session,
-        tool_calls_log,
-    )
-    return final_text, tool_calls_log, billing_error
+    app.include_router(spt_router, prefix="/spt")
+    app.include_router(merchant_router, prefix="/merchant")
+    _register_routes(app)
+    return app
 
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
-
-from acp_merchant import merchant_router, register_merchant  # noqa: E402
-from spt_handler import spt_router  # noqa: E402
-from x402_middleware import X402PaymentMiddleware  # noqa: E402
-
-_MERCHANT_JSON = _PROJECT_ROOT / "merchant.json"
-
-
-@asynccontextmanager
-async def lifespan(_app: FastAPI):
-    global anthropic_client
-
-    missing = [v for v in ["STRIPE_SECRET_KEY", "ANTHROPIC_API_KEY"] if not os.getenv(v)]
-    if missing:
-        raise RuntimeError(f"Missing required env vars: {missing}")
-
-    logger.info(f"Circle key loaded: {bool(os.getenv('CIRCLE_API_KEY'))}")
-    logger.info(
-        f"Circle entity secret loaded: {os.getenv('CIRCLE_ENTITY_SECRET', '')[:8]}..."
-    )
-
-    customer = stripe.Customer.create(name="AutoWallet Agent")
-    state["customer_id"] = customer.id
-    state["balance_usd"] = 10.0
-    state["transactions"] = []
-    logger.info("Stripe customer created: %s (balance: $10.00)", customer.id)
-
-    anthropic_client = anthropic.Anthropic(
-        api_key=ANTHROPIC_API_KEY,
-        max_retries=ANTHROPIC_MAX_RETRIES,
-        timeout=ANTHROPIC_TIMEOUT_SECONDS,
-    )
-    logger.info(
-        "Anthropic client configured (max_retries=%s, timeout=%ss)",
-        ANTHROPIC_MAX_RETRIES,
-        ANTHROPIC_TIMEOUT_SECONDS,
-    )
-
-    result = register_merchant()
-    merchant_id = result.get("id", "local-only")
-
-    print(f"""
-    ╔══════════════════════════════════════╗
-    ║  ACP + Circle Payment Agent Ready    ║
-    ║  Merchant ID : {merchant_id}
-    ║  Endpoint    : {os.getenv('PUBLIC_ENDPOINT_URL', 'http://localhost:8000')}
-    ║  Stripe rail : >= $0.01
-    ║  Circle rail : < $0.01
-    ╚══════════════════════════════════════╝
-    """)
-
-    yield
-
-    anthropic_client = None
-
-
-app = FastAPI(title="AutoWallet API", lifespan=lifespan)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://localhost:5174",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-app.include_router(spt_router, prefix="/spt")
-app.include_router(merchant_router, prefix="/merchant")
-app.add_middleware(X402PaymentMiddleware)
+# --- request / response models ----------------------------------------------
 
 
 class ChatRequest(BaseModel):
@@ -652,123 +131,160 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
 
 
-class ChatResponse(BaseModel):
-    response: str
-    tool_calls: list[dict[str, Any]]
-    transactions: list[dict[str, Any]]
-    balance_cents: int
-    session_id: str
-    billing_error: str | None = None
+class SearchRequest(BaseModel):
+    query: str = Field(min_length=1)
 
 
-class BalanceResponse(BaseModel):
-    balance_cents: int
+class AmountRequest(BaseModel):
+    amount_usd: float | None = Field(default=None, gt=0)
 
 
-class TopUpResponse(BaseModel):
-    balance_cents: int
-    transactions: list[dict[str, Any]]
+class SetBalanceRequest(BaseModel):
+    balance_usd: float = Field(ge=0)
 
 
-@app.post("/chat", response_model=ChatResponse)
-def post_chat(body: ChatRequest) -> ChatResponse:
-    text = body.message.strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="message is required")
-
-    session_id = body.session_id or str(uuid.uuid4())
-    conversation_history = list(chat_sessions.get(session_id, []))
-
-    try:
-        response_text, tool_calls, billing_error = run_claude_loop(text, conversation_history)
-    except anthropic.APIError as exc:
-        logger.exception("Anthropic API error on /chat")
-        status = getattr(exc, "status_code", None) or 502
-        message = getattr(exc, "message", None)
-        if not message:
-            body = getattr(exc, "body", None)
-            if isinstance(body, dict):
-                message = body.get("error", {}).get("message")
-        message = message or str(exc)
-        raise HTTPException(
-            status_code=502 if status >= 500 else 400,
-            detail=f"Claude API error ({status}): {message}",
-        ) from None
-    except stripe.StripeError:
-        logger.exception("Stripe error on /chat")
-        raise HTTPException(status_code=502, detail="Payment processing failed") from None
-    except Exception:
-        logger.exception("Unhandled error on /chat")
-        raise
-
-    if billing_error:
-        logger.error("Billing settlement failed after successful agent loop: %s", billing_error)
-
-    conversation_history.append({"role": "user", "content": text})
-    conversation_history.append({"role": "assistant", "content": response_text})
-    chat_sessions[session_id] = conversation_history
-
-    return ChatResponse(
-        response=response_text,
-        tool_calls=tool_calls,
-        transactions=list(state["transactions"]),
-        balance_cents=balance_cents(),
-        session_id=session_id,
-        billing_error=billing_error,
-    )
-
-
-@app.get("/wallet/balance", response_model=BalanceResponse)
-def get_balance() -> BalanceResponse:
-    return BalanceResponse(balance_cents=balance_cents())
-
-
-@app.post("/wallet/topup", response_model=TopUpResponse)
-def post_topup() -> TopUpResponse:
-    amount_cents = 1000
-    try:
-        intent = create_and_confirm_payment(amount_cents)
-    except stripe.StripeError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=exc.user_message or str(exc),
-        ) from exc
-
-    charge_id = stripe_charge_id_from_intent(intent)
-    topup_usd = amount_cents / 100
-    state["balance_usd"] += topup_usd
-    record_transaction(
-        reason="Wallet top-up",
-        amount_usd=-topup_usd,
-        stripe_charge_id=charge_id,
-    )
-    return TopUpResponse(
-        balance_cents=balance_cents(),
-        transactions=state["transactions"],
-    )
-
-
-@app.get("/transactions")
-def get_transactions() -> list[dict[str, Any]]:
-    return state["transactions"]
-
-
-@app.get("/health")
-def get_health() -> dict[str, Any]:
+def _wallet_snapshot(svc: Services) -> dict[str, Any]:
+    micros = svc.ledger.balance_micros
     return {
-        "status": "ok",
-        "merchant_registered": _MERCHANT_JSON.exists(),
-        "rails": ["stripe", "circle"],
-        "stripe_configured": bool(os.getenv("STRIPE_SECRET_KEY")),
-        "circle_configured": bool(os.getenv("CIRCLE_API_KEY")),
-        "threshold_usd": 0.01,
+        "balance_micros": micros,
+        "balance_usd": micros_to_usd(micros),
+        "balance_cents": micros // 10_000,
+        "transactions": svc.ledger.transactions(),
     }
 
 
-class SearchRequest(BaseModel):
-    query: str = ""
+def _register_routes(app: FastAPI) -> None:
+    def svc_of(request: Request) -> Services:
+        return request.app.state.services
+
+    @app.post("/chat")
+    def post_chat(body: ChatRequest, request: Request) -> dict[str, Any]:
+        svc = svc_of(request)
+        text = body.message.strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="message is required")
+        if svc.agent is None:
+            raise HTTPException(status_code=503, detail="ANTHROPIC_API_KEY not set")
+
+        session_id = body.session_id or str(uuid.uuid4())
+        history = list(svc.chat_sessions.get(session_id, []))
+        try:
+            result = svc.agent.run(text, history)
+        except anthropic.APIStatusError as exc:
+            logger.exception("Claude API error on /chat")
+            raise HTTPException(
+                status_code=502 if exc.status_code >= 500 else 400,
+                detail=f"Claude API error ({exc.status_code}): {exc.message}",
+            ) from None
+        except anthropic.APIConnectionError:
+            logger.exception("Claude API connection error on /chat")
+            raise HTTPException(status_code=502, detail="Could not reach the Claude API") from None
+
+        history += [{"role": "user", "content": text}, {"role": "assistant", "content": result.text}]
+        svc.chat_sessions[session_id] = history
+
+        return {
+            "response": result.text,
+            "tool_calls": result.tool_calls,
+            "search_results": result.search_results,
+            "events": result.events,
+            "session_id": session_id,
+            **_wallet_snapshot(svc),
+        }
+
+    @app.get("/wallet/balance")
+    def get_balance(request: Request) -> dict[str, Any]:
+        snap = _wallet_snapshot(svc_of(request))
+        snap.pop("transactions")
+        return snap
+
+    @app.get("/wallet/status")
+    def get_wallet_status(request: Request) -> dict[str, Any]:
+        svc = svc_of(request)
+        return {
+            "balance_usd": micros_to_usd(svc.ledger.balance_micros),
+            "rails": svc.router.status(),
+            "micropayment_rail": svc.settings.micropayment_rail,
+            "auto_topup": svc.topup.status(),
+            "demo_mode": svc.settings.demo_mode,
+            "agent_configured": svc.agent is not None,
+            "claude_model": svc.settings.claude_model,
+        }
+
+    @app.post("/wallet/topup")
+    def post_card_topup(request: Request) -> dict[str, Any]:
+        """Add funds by charging the Stripe test card."""
+        svc = svc_of(request)
+        amount = usd_to_micros(svc.settings.card_topup_usd)
+        result = svc.router.stripe.charge_card(amount, "AutoWallet card top-up")
+        if not result.ok:
+            raise HTTPException(status_code=502, detail=f"Card top-up failed: {result.error}")
+        svc.ledger.credit(amount, "Card top-up", rail="stripe", reference=result.reference)
+        return _wallet_snapshot(svc)
+
+    @app.post("/wallet/topup/robinhood")
+    def post_robinhood_topup(request: Request, body: AmountRequest | None = None) -> Any:
+        """Run the Robinhood treasury top-up now (same path auto top-up uses)."""
+        svc = svc_of(request)
+        amount = usd_to_micros(body.amount_usd) if body and body.amount_usd else None
+        event = svc.topup.run_now(amount)
+        payload = {"event": event, **_wallet_snapshot(svc)}
+        if event["status"] != "completed":
+            return JSONResponse(status_code=502, content=payload)
+        return payload
+
+    @app.get("/transactions")
+    def get_transactions(request: Request) -> list[dict[str, Any]]:
+        return svc_of(request).ledger.transactions()
+
+    @app.post("/search")
+    def post_search(
+        body: SearchRequest, request: Request, x_payment: str | None = Header(default=None)
+    ) -> Any:
+        svc = svc_of(request)
+        paid = require_payment(svc, x_payment, body.query)
+        if not isinstance(paid, PaymentReceipt):
+            return paid
+        found = search(body.query, brave_api_key=svc.settings.brave_search_api_key)
+        return JSONResponse(content=found, headers=paid.headers())
+
+    @app.get("/health")
+    def get_health(request: Request) -> dict[str, Any]:
+        svc = svc_of(request)
+        return {
+            "status": "ok",
+            "rails": {r["rail"]: r["available"] for r in svc.router.status()},
+            "chain_mode": svc.settings.chain_mode,
+            "robinhood_crypto_mode": svc.settings.crypto_mode,
+            "stripe_min_charge_usd": svc.settings.stripe_min_charge_usd,
+            "agent_configured": svc.agent is not None,
+        }
+
+    # --- demo helpers (DEMO_MODE=true) -------------------------------------
+
+    def require_demo(svc: Services) -> None:
+        if not svc.settings.demo_mode:
+            raise HTTPException(status_code=404, detail="Not found")
+
+    @app.post("/demo/set-balance")
+    def post_set_balance(body: SetBalanceRequest, request: Request) -> dict[str, Any]:
+        """Force the balance, e.g. to stage the 'runs out mid-task' auto top-up moment."""
+        svc = svc_of(request)
+        require_demo(svc)
+        svc.ledger.set_balance(usd_to_micros(Decimal(str(body.balance_usd))))
+        return _wallet_snapshot(svc)
+
+    @app.post("/demo/external-payment")
+    def post_external_payment(request: Request, body: AmountRequest | None = None) -> dict[str, Any]:
+        """Simulated chain only: mint a tx hash that pays the merchant, for trying `X-PAYMENT: tx <hash>`."""
+        svc = svc_of(request)
+        require_demo(svc)
+        chain = svc.router.chain
+        if not chain.simulated:
+            raise HTTPException(status_code=400, detail="Only available with ROBINHOOD_CHAIN_MODE=simulated")
+        amount = body.amount_usd if body and body.amount_usd else 0.01
+        result = chain.simulate_external_payment(usd_to_micros(amount))
+        return {"tx_hash": result.reference, "amount_usd": micros_to_usd(result.amount_micros)}
 
 
-@app.post("/search")
-def post_search(body: SearchRequest) -> dict[str, Any]:
-    return {"query": body.query, "results": mock_search_result(body.query)}
+app = create_app()

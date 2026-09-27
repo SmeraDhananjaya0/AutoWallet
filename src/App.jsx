@@ -1,48 +1,51 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import ChatPanel from './components/ChatPanel';
 import WalletPanel from './components/WalletPanel';
 import {
-  INITIAL_MESSAGES,
+  WELCOME_MESSAGE,
   getBalance,
   getTransactions,
+  getWalletStatus,
   sendChatMessage,
-  topUpWallet,
+  setDemoBalance,
+  topUpCard,
+  topUpRobinhood,
 } from './api';
 
-let messageId = 100;
-
-function nextId() {
-  messageId += 1;
-  return `msg_${messageId}`;
-}
-
 export default function App() {
-  const [messages, setMessages] = useState(INITIAL_MESSAGES);
-  const [balanceCents, setBalanceCents] = useState(1000);
+  const nextId = useRef(0);
+  const newId = () => `msg_${(nextId.current += 1)}`;
+
+  const [messages, setMessages] = useState([WELCOME_MESSAGE]);
+  const [balanceUsd, setBalanceUsd] = useState(0);
   const [transactions, setTransactions] = useState([]);
+  const [walletStatus, setWalletStatus] = useState(null);
   const [agentStatus, setAgentStatus] = useState('idle');
   const [inputValue, setInputValue] = useState('');
   const [isSending, setIsSending] = useState(false);
-  const [isToppingUp, setIsToppingUp] = useState(false);
+  const [busyAction, setBusyAction] = useState(null);
+  const [walletError, setWalletError] = useState(null);
   const [sessionId, setSessionId] = useState(null);
 
-  const sortTransactions = (txns) =>
-    [...txns].sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  const applyWallet = useCallback((data) => {
+    if (typeof data?.balance_micros === 'number') setBalanceUsd(data.balance_micros / 1_000_000);
+    if (Array.isArray(data?.transactions)) setTransactions(data.transactions);
+  }, []);
 
-  const applyWalletFromResponse = useCallback((data) => {
-    if (typeof data?.balance_cents === 'number') {
-      setBalanceCents(data.balance_cents);
-    }
-    if (Array.isArray(data?.transactions)) {
-      setTransactions(sortTransactions(data.transactions));
-    }
+  const refreshStatus = useCallback(() => {
+    getWalletStatus().then(setWalletStatus).catch(() => {});
   }, []);
 
   const refreshWallet = useCallback(async () => {
-    const [balance, txns] = await Promise.all([getBalance(), getTransactions()]);
-    setBalanceCents(balance.balance_cents);
-    setTransactions(sortTransactions(txns));
-  }, []);
+    try {
+      const [balance, txns] = await Promise.all([getBalance(), getTransactions()]);
+      applyWallet({ ...balance, transactions: txns });
+      setWalletError(null);
+    } catch (err) {
+      setWalletError(`Backend unreachable: ${err.message}`);
+    }
+    refreshStatus();
+  }, [applyWallet, refreshStatus]);
 
   useEffect(() => {
     refreshWallet();
@@ -52,40 +55,38 @@ export default function App() {
     const text = inputValue.trim();
     if (!text || isSending) return;
 
-    const userMsg = { id: nextId(), role: 'user', content: text };
-    setMessages((prev) => [...prev, userMsg]);
+    setMessages((prev) => [...prev, { id: newId(), role: 'user', content: text }]);
     setInputValue('');
     setIsSending(true);
     setAgentStatus('thinking');
 
     try {
       const data = await sendChatMessage(text, sessionId);
-      if (data.session_id) {
-        setSessionId(data.session_id);
-      }
+      if (data.session_id) setSessionId(data.session_id);
 
       if (data.tool_calls?.length) {
         setAgentStatus('spending');
-        await new Promise((r) => setTimeout(r, 600));
+        await new Promise((r) => setTimeout(r, 500));
       }
 
-      const agentMsg = {
-        id: nextId(),
-        role: 'agent',
-        text: data.response,
-        tool_calls: data.tool_calls || [],
-        search_results: data.search_results || [],
-      };
-      setMessages((prev) => [...prev, agentMsg]);
-      applyWalletFromResponse(data);
-    } catch (err) {
       setMessages((prev) => [
         ...prev,
         {
-          id: nextId(),
+          id: newId(),
           role: 'agent',
-          text: `Something went wrong: ${err.message}`,
+          text: data.response,
+          tool_calls: data.tool_calls || [],
+          search_results: data.search_results || [],
+          events: data.events || [],
         },
+      ]);
+      applyWallet(data);
+      setWalletError(null);
+      refreshStatus();
+    } catch (err) {
+      setMessages((prev) => [
+        ...prev,
+        { id: newId(), role: 'agent', error: true, text: `Something went wrong: ${err.message}` },
       ]);
     } finally {
       setIsSending(false);
@@ -93,14 +94,18 @@ export default function App() {
     }
   };
 
-  const handleTopUp = async () => {
-    if (isToppingUp) return;
-    setIsToppingUp(true);
+  const runWalletAction = async (name, action) => {
+    if (busyAction) return;
+    setBusyAction(name);
+    setWalletError(null);
     try {
-      const data = await topUpWallet();
-      applyWalletFromResponse(data);
+      applyWallet(await action());
+    } catch (err) {
+      setWalletError(err.message);
+      if (err.data) applyWallet(err.data);
     } finally {
-      setIsToppingUp(false);
+      setBusyAction(null);
+      refreshStatus();
     }
   };
 
@@ -115,10 +120,14 @@ export default function App() {
         isSending={isSending}
       />
       <WalletPanel
-        balanceCents={balanceCents}
+        balanceUsd={balanceUsd}
         transactions={transactions}
-        onTopUp={handleTopUp}
-        isToppingUp={isToppingUp}
+        walletStatus={walletStatus}
+        busyAction={busyAction}
+        error={walletError}
+        onCardTopUp={() => runWalletAction('card', topUpCard)}
+        onRobinhoodTopUp={() => runWalletAction('robinhood', topUpRobinhood)}
+        onDrain={() => runWalletAction('drain', () => setDemoBalance(0.002))}
       />
     </div>
   );
