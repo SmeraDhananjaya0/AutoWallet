@@ -31,6 +31,8 @@ def make_settings(**overrides: Any) -> Settings:
         micropayment_rail="robinhood_chain",
         chain_mode="simulated",
         merchant_address="",
+        agent_wallet_private_key="",
+        treasury_private_key="",
         crypto_mode="simulated",
         auto_topup_enabled=True,
         auto_topup_threshold_usd=1.0,

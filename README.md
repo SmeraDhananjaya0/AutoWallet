@@ -84,6 +84,23 @@ Robinhood in the app. The ledger is credited only after both steps succeed.
   python -m backend.mcp_server --http   # streamable HTTP, for remote agents
   ```
 
+## Running on Robinhood Chain testnet (play money)
+
+1. Create three wallets (agent, treasury, merchant) and put their keys in `backend/.env`:
+   `AGENT_WALLET_PRIVATE_KEY`, `TREASURY_PRIVATE_KEY`, `MERCHANT_ADDRESS`. Use throwaway wallets, never ones holding real funds.
+2. Get free testnet ETH (for gas) for the agent and treasury from a faucet, e.g.
+   [QuickNode](https://faucet.quicknode.com/robinhood/testnet). A few thousandths of an ETH is plenty.
+3. Deploy the play-money token and fund the wallets. Robinhood publishes no testnet USDG, so
+   `contracts/TestUSDG.sol` is a minimal 6-decimal ERC-20 ("tUSDG"):
+
+   ```bash
+   pip install py-solc-x
+   python scripts/deploy_test_token.py      # saves ROBINHOOD_CHAIN_TOKEN_ADDRESS to backend/.env
+   ```
+4. Set `ROBINHOOD_CHAIN_MODE=testnet` and restart the API. Transfers now show explorer links to
+   [explorer.testnet.chain.robinhood.com](https://explorer.testnet.chain.robinhood.com). The Robinhood *buy* step stays
+   simulated because Robinhood has no trading sandbox.
+
 ## Going live (real money)
 
 | Setting | What it does |
