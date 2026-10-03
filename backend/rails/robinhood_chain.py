@@ -47,6 +47,12 @@ ERC20_ABI = [
 ]
 
 RECEIPT_TIMEOUT_SECONDS = 30
+
+
+class ChainTxError(Exception):
+    def __init__(self, message: str, tx_hash: str | None = None):
+        super().__init__(message)
+        self.tx_hash = tx_hash
 SIMULATED_AGENT_ADDRESS = "0x000000000000000000000000000000000000a6e7"
 SIMULATED_MERCHANT_ADDRESS = "0x000000000000000000000000000000000000beef"
 
@@ -181,6 +187,11 @@ class RobinhoodChainRail:
             return None
         return f"{self._s.chain_explorer_url}/tx/{tx_hash}"
 
+    def explorer_address_url(self, address: str) -> str | None:
+        if self.simulated:
+            return None
+        return f"{self._s.chain_explorer_url}/address/{address}"
+
     def status(self) -> dict[str, Any]:
         ok, reason = self.available()
         data: dict[str, Any] = {
@@ -202,6 +213,39 @@ class RobinhoodChainRail:
                 data["agent_token_balance_error"] = str(exc)
         return data
 
+    # --- generic contract calls (used by the demo exchange) ---------------
+
+    @property
+    def web3(self) -> Any:
+        return self._w3
+
+    def address_of(self, who: str) -> str:
+        account = self._agent if who == "agent" else self._treasury
+        if account is None:
+            raise ChainTxError(f"{who} wallet not configured")
+        return account.address
+
+    def send_call(self, who: str, call: Any) -> tuple[str, Any]:
+        """Sign and send ``call`` (a web3 contract function) from the agent or treasury wallet.
+
+        Returns ``(tx_hash, receipt)``; raises ChainTxError if sending fails or the tx reverts.
+        """
+        account = self._agent if who == "agent" else self._treasury
+        if self._w3 is None or account is None:
+            raise ChainTxError(f"chain not configured for {who} ({self._config_error or 'missing key'})")
+        try:
+            with self._nonce_lock:
+                nonce = self._w3.eth.get_transaction_count(account.address, "pending")
+                tx = call.build_transaction({"from": account.address, "nonce": nonce, "chainId": self._s.chain_id})
+                tx_hash = self._w3.eth.send_raw_transaction(account.sign_transaction(tx).raw_transaction)
+            receipt = self._w3.eth.wait_for_transaction_receipt(tx_hash, timeout=RECEIPT_TIMEOUT_SECONDS)
+        except Exception as exc:
+            raise ChainTxError(str(exc)) from exc
+        hex_hash = "0x" + bytes(tx_hash).hex()
+        if receipt.status != 1:
+            raise ChainTxError("transaction reverted", tx_hash=hex_hash)
+        return hex_hash, receipt
+
     # --- internals ------------------------------------------------------
 
     def _transfer(self, source: str, to: str, amount_micros: int, memo: str) -> PaymentResult:
@@ -220,25 +264,12 @@ class RobinhoodChainRail:
         if not ok:
             return PaymentResult(self.name, amount_micros, FAILED, error=reason)
 
-        account = self._agent if source == "agent" else self._treasury
         try:
-            with self._nonce_lock:
-                nonce = self._w3.eth.get_transaction_count(account.address, "pending")
-                tx = self._token.functions.transfer(to, self.to_units(amount_micros)).build_transaction(
-                    {"from": account.address, "nonce": nonce, "chainId": self._s.chain_id}
-                )
-                signed = account.sign_transaction(tx)
-                tx_hash = self._w3.eth.send_raw_transaction(signed.raw_transaction)
-            receipt = self._w3.eth.wait_for_transaction_receipt(tx_hash, timeout=RECEIPT_TIMEOUT_SECONDS)
-        except Exception as exc:
+            hex_hash, receipt = self.send_call(source, self._token.functions.transfer(to, self.to_units(amount_micros)))
+        except ChainTxError as exc:
             logger.warning("Robinhood Chain transfer failed (%s -> %s): %s", source, to, exc)
-            return PaymentResult(self.name, amount_micros, FAILED, error=str(exc))
+            return PaymentResult(self.name, amount_micros, FAILED, reference=exc.tx_hash or "", error=str(exc))
 
-        hex_hash = "0x" + bytes(tx_hash).hex()
-        if receipt.status != 1:
-            return PaymentResult(
-                self.name, amount_micros, FAILED, reference=hex_hash, error="transaction reverted"
-            )
         logger.info("Robinhood Chain transfer %s -> %s settled: %s", source, to, hex_hash)
         return PaymentResult(
             rail=self.name,

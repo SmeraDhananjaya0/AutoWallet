@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import threading
 from decimal import Decimal
-from typing import Any
+from typing import Any, Callable
 
 from backend.config import Settings
 from backend.ledger import Ledger, micros_to_usd, usd_to_micros, utc_now_iso
@@ -39,11 +39,14 @@ class AutoTopUp:
         ledger: Ledger,
         crypto: CryptoTreasury,
         chain: RobinhoodChainRail,
+        portfolio_funder: Callable[[int], dict[str, Any] | None] | None = None,
     ):
         self._s = settings
         self._ledger = ledger
         self._crypto = crypto
         self._chain = chain
+        # Optional: sell from the agent's demo portfolio before tapping the Robinhood treasury.
+        self.portfolio_funder = portfolio_funder
         self._lock = threading.Lock()
         self.events: list[dict[str, Any]] = []
         self.enabled = settings.auto_topup_enabled
@@ -81,6 +84,37 @@ class AutoTopUp:
         }
         self.events.insert(0, event)
 
+        # 0. Self-funding: sell part of the agent's portfolio first (credits the ledger itself).
+        if self.portfolio_funder is not None:
+            try:
+                sold = self.portfolio_funder(amount_micros)
+            except Exception as exc:
+                logger.warning("Portfolio funding failed, falling back to Robinhood: %s", exc)
+                event["steps"].append({"step": "portfolio_sell", "ok": False, "error": str(exc)})
+                sold = None
+            if sold:
+                last_tx = sold["txs"][-1] if sold["txs"] else {}
+                event.update(
+                    source="portfolio",
+                    amount_usd=micros_to_usd(sold["amount_micros"]),
+                    status="completed",
+                    transaction_id=sold["transaction_id"],
+                )
+                event["steps"].append(
+                    {
+                        "step": "portfolio_sell",
+                        "ok": True,
+                        "symbol": sold["symbol"],
+                        "detail": f"Sold {sold['shares']} {sold['token']} @ ${sold['price_usd']:,.2f}",
+                        "tx_hash": last_tx.get("hash"),
+                        "explorer_url": last_tx.get("explorer_url"),
+                        "simulated": sold["simulated"],
+                    }
+                )
+                logger.info("Auto top-up funded from portfolio: %s", event["steps"][-1]["detail"])
+                return event
+
+        event["source"] = "robinhood"
         remaining = self.daily_cap_micros - self.spent_last_24h_micros()
         if amount_micros > remaining:
             event["status"] = "blocked"

@@ -3,9 +3,10 @@ import { formatUsd, truncateId } from '../format';
 const STEP_LABELS = {
   robinhood_buy: 'Bought on Robinhood',
   robinhood_chain_transfer: 'Treasury → agent on Robinhood Chain',
+  portfolio_sell: 'Sold from portfolio',
 };
 
-export default function TopUpCard({ amount_usd, status, trigger, steps = [], error }) {
+export default function TopUpCard({ amount_usd, status, trigger, source, steps = [], error }) {
   const ok = status === 'completed';
 
   return (
@@ -20,13 +21,17 @@ export default function TopUpCard({ amount_usd, status, trigger, steps = [], err
         </span>
       </div>
       {trigger === 'low_balance' && (
-        <p className="mb-2 text-xs text-muted">Wallet ran low mid-task, so the agent refilled it before paying.</p>
+        <p className="mb-2 text-xs text-muted">
+          {source === 'portfolio'
+            ? 'Wallet ran low mid-task, so the agent sold part of its portfolio to keep going.'
+            : 'Wallet ran low mid-task, so the agent refilled it before paying.'}
+        </p>
       )}
       <ol className="space-y-1 text-xs">
         {steps.map((step) => (
           <li key={step.step} className="flex items-center justify-between gap-2">
             <span className={step.ok ? 'text-text/90' : 'text-spend'}>
-              {step.ok ? '✓' : '✕'} {STEP_LABELS[step.step] || step.step}
+              {step.ok ? '✓' : '✕'} {step.detail || STEP_LABELS[step.step] || step.step}
               {step.simulated && <span className="ml-1 text-muted">(sim)</span>}
             </span>
             <span className="font-mono text-muted" title={step.order_id || step.tx_hash}>

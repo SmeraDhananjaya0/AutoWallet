@@ -14,6 +14,7 @@ export default function ChatPanel({
   onInputChange,
   onSend,
   isSending,
+  onTrade,
 }) {
   const threadRef = useRef(null);
   const status = STATUS_STYLES[agentStatus] || STATUS_STYLES.idle;
@@ -55,7 +56,7 @@ export default function ChatPanel({
 
       <div ref={threadRef} className="flex-1 space-y-4 overflow-y-auto px-6 py-5">
         {messages.map((msg) => (
-          <MessageBubble key={msg.id} message={msg} />
+          <MessageBubble key={msg.id} message={msg} onTrade={onTrade} />
         ))}
         {agentStatus === 'thinking' && (
           <div className="flex justify-start">
@@ -79,7 +80,7 @@ export default function ChatPanel({
             type="text"
             value={inputValue}
             onChange={(e) => onInputChange(e.target.value)}
-            placeholder="Ask the agent to complete a task…"
+            placeholder="Ask the agent to research something, or research a stock and propose a trade…"
             disabled={isSending}
             className="flex-1 rounded-lg border border-border bg-bg px-4 py-2.5 text-sm text-text placeholder:text-muted focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent disabled:opacity-50"
           />

@@ -7,6 +7,7 @@ able to build isolated settings with ``dataclasses.replace``.
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
 from dataclasses import dataclass
@@ -73,6 +74,7 @@ class Settings:
     # Wallet / ledger
     initial_balance_usd: float
     ledger_db_path: str
+    database_url: str
     card_topup_usd: float
     demo_mode: bool
 
@@ -94,6 +96,12 @@ class Settings:
     agent_wallet_private_key: str
     treasury_private_key: str
     merchant_address: str
+
+    # Demo trading (play-money stock tokens on testnet, real Chainlink prices)
+    demo_exchange_address: str
+    demo_stock_tokens: dict
+    price_source: str
+    price_rpc_url: str
 
     # Robinhood Crypto Trading API (treasury buys)
     crypto_mode: str
@@ -123,6 +131,9 @@ class Settings:
     public_base_url: str
 
     # Search provider
+    search_provider: str
+    report_price_usd: float
+    search_model: str
     brave_search_api_key: str
 
     @classmethod
@@ -137,6 +148,8 @@ class Settings:
             initial_balance_usd=_float("WALLET_INITIAL_BALANCE_USD", 10.0),
             # Empty string = in-memory ledger (resets on restart).
             ledger_db_path=_env("LEDGER_DB_PATH", str(BACKEND_DIR / "data" / "autowallet.db")),
+            # Postgres for all state (required for multi-instance hosting like Vercel).
+            database_url=_env("DATABASE_URL"),
             card_topup_usd=_float("CARD_TOPUP_USD", 10.0),
             demo_mode=_bool("DEMO_MODE", True),
             stripe_secret_key=_env("STRIPE_SECRET_KEY"),
@@ -154,6 +167,11 @@ class Settings:
             agent_wallet_private_key=_env("AGENT_WALLET_PRIVATE_KEY"),
             treasury_private_key=_env("TREASURY_PRIVATE_KEY"),
             merchant_address=_env("MERCHANT_ADDRESS"),
+            demo_exchange_address=_env("DEMO_EXCHANGE_ADDRESS"),
+            demo_stock_tokens=json.loads(_env("DEMO_STOCK_TOKENS") or "{}"),
+            # chainlink = live prices read (free) from Chainlink on Robinhood Chain mainnet
+            price_source=_choice("PRICE_SOURCE", "chainlink", ("chainlink", "fixed")),
+            price_rpc_url=_env("PRICE_RPC_URL", "https://rpc.mainnet.chain.robinhood.com"),
             crypto_mode=_choice("ROBINHOOD_CRYPTO_MODE", "simulated", CRYPTO_MODES),
             crypto_api_key=_env("ROBINHOOD_API_KEY"),
             crypto_private_key_b64=_env("ROBINHOOD_PRIVATE_KEY"),
@@ -174,6 +192,9 @@ class Settings:
             spt_issuer_key=_env("SPT_ISSUER_KEY"),
             spt_max_amount_usd=_float("SPT_MAX_AMOUNT_USD", 1.0),
             public_base_url=_env("PUBLIC_ENDPOINT_URL", "http://localhost:8000").rstrip("/"),
+            search_provider=_choice("SEARCH_PROVIDER", "auto", ("auto", "claude", "brave", "mock")),
+            search_model=_env("SEARCH_MODEL"),  # empty = same as CLAUDE_MODEL
+            report_price_usd=_float("REPORT_PRICE_USD", 0.75),
             brave_search_api_key=_env("BRAVE_SEARCH_API_KEY"),
         )
 

@@ -1,4 +1,7 @@
+import { useState } from 'react';
 import TransactionRow from './TransactionRow';
+import PortfolioPanel from './PortfolioPanel';
+import RulesPanel from './RulesPanel';
 import RailBadge from './RailBadge';
 import { formatUsd } from '../format';
 
@@ -48,7 +51,11 @@ export default function WalletPanel({
   onCardTopUp,
   onRobinhoodTopUp,
   onDrain,
+  portfolio,
+  rules,
+  onSaveRules,
 }) {
+  const [tab, setTab] = useState('wallet');
   const threshold = walletStatus?.auto_topup?.threshold_usd ?? 2;
   const balanceColor = balanceUsd < threshold ? 'text-spend' : 'text-success';
   const buttonClass =
@@ -56,10 +63,29 @@ export default function WalletPanel({
 
   return (
     <section className="flex h-full min-h-0 w-[40%] flex-col bg-bg">
-      <header className="shrink-0 border-b border-border px-6 py-4">
-        <h2 className="text-sm font-medium uppercase tracking-wider text-muted">Wallet</h2>
+      <header className="flex shrink-0 gap-1 border-b border-border px-4 py-2.5">
+        {[
+          ['wallet', 'Wallet'],
+          ['portfolio', 'Portfolio'],
+          ['rules', rules && !rules.trading_enabled ? 'Rules · halted' : 'Rules'],
+        ].map(([key, label]) => (
+          <button
+            key={key}
+            type="button"
+            onClick={() => setTab(key)}
+            className={`rounded-md px-3 py-1.5 text-xs font-medium uppercase tracking-wider transition ${
+              tab === key ? 'bg-panel text-text' : 'text-muted hover:text-text'
+            } ${key === 'rules' && rules && !rules.trading_enabled ? 'text-spend' : ''}`}
+          >
+            {label}
+          </button>
+        ))}
       </header>
 
+      {tab === 'portfolio' && <PortfolioPanel portfolio={portfolio} />}
+      {tab === 'rules' && <RulesPanel rules={rules} onSave={onSaveRules} />}
+      {tab === 'wallet' && (
+      <>
       <div className="shrink-0 border-b border-border px-6 py-8 text-center">
         <p className="text-xs font-medium uppercase tracking-wider text-muted">Balance</p>
         <p className={`mt-2 font-mono text-5xl font-semibold tracking-tight ${balanceColor}`}>
@@ -109,6 +135,8 @@ export default function WalletPanel({
           )}
         </div>
       </div>
+      </>
+      )}
     </section>
   );
 }

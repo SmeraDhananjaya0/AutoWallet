@@ -26,7 +26,8 @@ class StripeRail:
         self._setup_error: str | None = None
         self.min_charge_micros = usd_to_micros(settings.stripe_min_charge_usd)
 
-    def setup(self) -> None:
+    def setup(self, customer_id: str | None = None) -> None:
+        """Reuse ``customer_id`` when given (multi-instance hosting); otherwise create one."""
         key = self._settings.stripe_secret_key
         if not key:
             self._setup_error = "STRIPE_SECRET_KEY not set"
@@ -36,6 +37,9 @@ class StripeRail:
             self._setup_error = "Live Stripe key refused (set STRIPE_ALLOW_LIVE_KEYS=true to override)"
             return
         stripe.api_key = key
+        if customer_id:
+            self.customer_id = customer_id
+            return
         try:
             customer = stripe.Customer.create(name="AutoWallet Agent")
         except stripe.StripeError as exc:
@@ -92,6 +96,15 @@ class StripeRail:
             status=SETTLED,
             reference=_charge_id(intent),
         )
+
+    def refund(self, charge_id: str, amount_micros: int, memo: str) -> PaymentResult:
+        """Refund a card charge (full amount). Card payments, unlike on-chain transfers, are reversible."""
+        try:
+            refund = stripe.Refund.create(charge=charge_id, metadata={"reason": memo[:500]})
+        except stripe.StripeError as exc:
+            logger.warning("Stripe refund failed for %s: %s", charge_id, exc.user_message or exc)
+            return PaymentResult(self.name, amount_micros, FAILED, error=str(exc.user_message or exc))
+        return PaymentResult(self.name, amount_micros, SETTLED, reference=refund.id)
 
     def status(self) -> dict[str, Any]:
         ok, reason = self.available()

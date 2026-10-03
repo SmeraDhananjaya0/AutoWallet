@@ -45,3 +45,9 @@ env/
 *.local
 .idea/
 .vscode/settings.json
+.vercel
+.env*
+
+# Keep the public template tracked (Vercel CLI added .env* above)
+!.env.example
+!**/.env.example

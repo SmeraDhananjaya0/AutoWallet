@@ -1,9 +1,12 @@
 import Markdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import ToolCallCard from './ToolCallCard';
 import SearchResultCard from './SearchResultCard';
 import TopUpCard from './TopUpCard';
+import ReportCard from './ReportCard';
+import TradeProposalCard from './TradeProposalCard';
 
-export default function MessageBubble({ message }) {
+export default function MessageBubble({ message, onTrade }) {
   if (message.role === 'user') {
     return (
       <div className="flex justify-end">
@@ -14,7 +17,8 @@ export default function MessageBubble({ message }) {
     );
   }
 
-  const hasCards = message.events?.length || message.tool_calls?.length || message.search_results?.length;
+  const hasCards =
+    message.events?.length || message.tool_calls?.length || message.search_results?.length || message.reports?.length || message.trade_proposals?.length;
 
   return (
     <div className="flex justify-start">
@@ -32,9 +36,18 @@ export default function MessageBubble({ message }) {
         {message.search_results?.map((sr, i) => (
           <SearchResultCard key={`search-${i}`} {...sr} />
         ))}
+        {message.reports?.map((r, i) => (
+          <ReportCard key={`report-${i}`} {...r} />
+        ))}
+        {message.trade_proposals?.map((p) => (
+          <TradeProposalCard key={p.id} proposal={p} onDecide={onTrade} />
+        ))}
         {message.text && (
           <div className={`agent-markdown leading-relaxed text-text/95 ${hasCards ? 'mt-3' : ''}`}>
-            <Markdown components={{ a: (props) => <a {...props} target="_blank" rel="noreferrer" /> }}>
+            <Markdown
+              remarkPlugins={[remarkGfm]}
+              components={{ a: (props) => <a {...props} target="_blank" rel="noreferrer" /> }}
+            >
               {message.text}
             </Markdown>
           </div>

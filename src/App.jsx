@@ -3,7 +3,11 @@ import ChatPanel from './components/ChatPanel';
 import WalletPanel from './components/WalletPanel';
 import {
   WELCOME_MESSAGE,
+  decideTrade,
   getBalance,
+  getPortfolio,
+  getTradingRules,
+  saveTradingRules,
   getTransactions,
   getWalletStatus,
   sendChatMessage,
@@ -26,6 +30,8 @@ export default function App() {
   const [busyAction, setBusyAction] = useState(null);
   const [walletError, setWalletError] = useState(null);
   const [sessionId, setSessionId] = useState(null);
+  const [portfolio, setPortfolio] = useState(null);
+  const [rules, setRules] = useState(null);
 
   const applyWallet = useCallback((data) => {
     if (typeof data?.balance_micros === 'number') setBalanceUsd(data.balance_micros / 1_000_000);
@@ -34,6 +40,12 @@ export default function App() {
 
   const refreshStatus = useCallback(() => {
     getWalletStatus().then(setWalletStatus).catch(() => {});
+    getPortfolio()
+      .then((p) => {
+        setPortfolio(p);
+        setRules(p.rules);
+      })
+      .catch(() => {});
   }, []);
 
   const refreshWallet = useCallback(async () => {
@@ -77,7 +89,9 @@ export default function App() {
           text: data.response,
           tool_calls: data.tool_calls || [],
           search_results: data.search_results || [],
+          reports: data.reports || [],
           events: data.events || [],
+          trade_proposals: data.trade_proposals || [],
         },
       ]);
       applyWallet(data);
@@ -109,6 +123,34 @@ export default function App() {
     }
   };
 
+  const replaceProposal = (proposal) =>
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.trade_proposals?.some((p) => p.id === proposal.id)
+          ? { ...m, trade_proposals: m.trade_proposals.map((p) => (p.id === proposal.id ? proposal : p)) }
+          : m,
+      ),
+    );
+
+  const handleTrade = async (id, action) => {
+    try {
+      const data = await decideTrade(id, action);
+      replaceProposal(data.proposal);
+      applyWallet(data);
+      if (data.portfolio) setPortfolio(data.portfolio);
+    } catch (err) {
+      setWalletError(err.message);
+    } finally {
+      refreshStatus();
+    }
+  };
+
+  const handleSaveRules = async (next) => {
+    const saved = await saveTradingRules(next);
+    setRules(saved);
+    refreshStatus();
+  };
+
   return (
     <div className="flex h-screen min-w-[1280px] overflow-hidden bg-bg">
       <ChatPanel
@@ -118,6 +160,7 @@ export default function App() {
         onInputChange={setInputValue}
         onSend={handleSend}
         isSending={isSending}
+        onTrade={handleTrade}
       />
       <WalletPanel
         balanceUsd={balanceUsd}
@@ -128,6 +171,9 @@ export default function App() {
         onCardTopUp={() => runWalletAction('card', topUpCard)}
         onRobinhoodTopUp={() => runWalletAction('robinhood', topUpRobinhood)}
         onDrain={() => runWalletAction('drain', () => setDemoBalance(0.002))}
+        portfolio={portfolio}
+        rules={rules}
+        onSaveRules={handleSaveRules}
       />
     </div>
   );

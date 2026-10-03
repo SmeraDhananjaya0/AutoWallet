@@ -41,6 +41,11 @@ With only `ANTHROPIC_API_KEY` set, everything else runs **simulated**: Robinhood
 Chain transfers return fake tx hashes and Robinhood orders are fake fills (both are
 tagged `sim` in the UI). Add a Stripe test key to enable card top-ups.
 
+### Demo: both rails in one chat
+
+Ask: *"Write me a deep research report on Robinhood Chain: its launch, adoption numbers, partners, and criticisms. Use the premium report tool."*
+The report ($0.75) settles on Stripe; ordinary searches ($0.001-$0.010) settle on Robinhood Chain.
+
 ### Demo: "runs out of money mid-task"
 
 1. Click **Drain to $0.002** in the wallet panel (or `POST /demo/set-balance`).
@@ -61,6 +66,8 @@ tagged `sim` in the UI). Add a Stripe test key to enable card top-ups.
 | Robinhood treasury | `backend/treasury/robinhood_crypto.py` | Crypto Trading API client (Ed25519-signed requests). |
 | Auto top-up | `backend/treasury/auto_topup.py` | Threshold, per-event amount, rolling 24h cap. |
 | Agent | `backend/agent.py` | Claude tool loop. `search_web` charges first; a failed payment returns an error and no results. |
+| Premium report | `backend/agent.py`, `backend/search.py` | `deep_research_report`: flat $0.75 (`REPORT_PRICE_USD`), so it settles on **Stripe**; several Claude web searches then a sourced report. Refunds the card if the report fails after payment. |
+| Search | `backend/search.py` | `SEARCH_PROVIDER=auto`: Brave if keyed, else Claude web search (your Anthropic key), else mock. |
 
 **Why a treasury wallet?** Robinhood's Crypto Trading API covers accounts,
 holdings, market data and orders, but has **no withdrawal endpoint**. So the
@@ -83,6 +90,25 @@ Robinhood in the app. The ledger is credited only after both steps succeed.
   python -m backend.mcp_server          # stdio, for Claude Code / Claude Desktop
   python -m backend.mcp_server --http   # streamable HTTP, for remote agents
   ```
+
+## Demo trading (testnet, play money)
+
+The agent can research stocks and **propose** trades; only you can approve them.
+
+- **Assets:** play-money demo stock tokens (`dNVDA`, `dAAPL`, `dTSLA`, `dGOOGL`, `dMSFT`, `dSPY`) on Robinhood Chain
+  testnet. They are *not* Robinhood Stock Tokens.
+- **Prices:** real, read for free from the Chainlink feed for each Robinhood Stock Token on Robinhood Chain mainnet
+  (`backend/trading/prices.py`).
+- **Exchange:** `contracts/DemoExchange.sol` swaps tUSDG for demo tokens at the posted Chainlink price (mint on buy,
+  burn on sell) and rejects prices older than an hour. Deploy with `python scripts/deploy_demo_exchange.py`.
+- **Flow:** Claude calls `propose_trade` → a proposal card appears → **Approve** executes on testnet (price post if
+  stale, one-time tUSDG approval, swap), each step linked to the explorer. Nothing executes without approval.
+- **Rules** (Rules tab): kill switch, per-trade cap, 24h limit, allowed tickers, enough cash. Checked when the agent
+  proposes *and* again when you approve.
+- **Self-funding:** with "Fund spending from portfolio" on, a low wallet sells part of the largest position before
+  tapping the Robinhood treasury.
+
+Try: *"Research how NVIDIA is doing lately with one search, then propose buying $10 of it if it looks good."*
 
 ## Running on Robinhood Chain testnet (play money)
 

@@ -48,6 +48,8 @@ class PaymentReceipt:
 
 
 class ReplayGuard:
+    """In-process; ``backend.db.PgReplayGuard`` is the shared version."""
+
     def __init__(self) -> None:
         self._seen: set[str] = set()
         self._lock = threading.Lock()

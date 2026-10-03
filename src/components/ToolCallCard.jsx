@@ -14,9 +14,11 @@ export default function ToolCallCard({
   error,
 }) {
   const failed = status === 'failed';
+  const searchFailed = status === 'paid_search_failed';
+  const refunded = status === 'refunded';
 
   return (
-    <div className={`mt-2 rounded-lg border bg-bg/60 p-3 ${failed ? 'border-spend/50' : 'border-border'}`}>
+    <div className={`mt-2 rounded-lg border bg-bg/60 p-3 ${failed || searchFailed ? 'border-spend/50' : 'border-border'}`}>
       <div className="mb-2 flex items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <span className="rounded bg-accent/20 px-2 py-0.5 text-xs font-medium uppercase tracking-wide text-accent">
@@ -32,8 +34,15 @@ export default function ToolCallCard({
       <div className="mt-2 flex flex-wrap items-center justify-between gap-2 border-t border-border pt-2 text-xs">
         {failed ? (
           <span className="font-medium text-spend">Payment failed: {error}</span>
+        ) : refunded ? (
+          <span className="font-medium text-muted">
+            Refunded {formatUsd(amount_usd)} <span className="font-normal">· {error}</span>
+          </span>
         ) : (
-          <span className="font-medium text-spend">Paid {formatUsd(amount_usd)}</span>
+          <span className="font-medium text-spend">
+            Paid {formatUsd(amount_usd)}
+            {searchFailed && <span className="ml-1 font-normal">· search failed: {error}</span>}
+          </span>
         )}
         {reference &&
           (explorer_url ? (

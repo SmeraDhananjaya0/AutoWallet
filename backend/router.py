@@ -108,5 +108,21 @@ class PaymentRouter:
             True, amount_micros, rail=rail.name, payment=result, transaction=txn.to_dict(), events=events
         )
 
+    def refund(self, outcome: ChargeOutcome, reason: str) -> dict[str, Any] | None:
+        """Undo a settled charge when the thing it paid for couldn't be delivered.
+
+        Only card charges can be reversed; on-chain transfers are final.
+        Returns the refund transaction, or None if the charge can't be refunded.
+        """
+        if not outcome.ok or outcome.rail != self.stripe.name or outcome.payment is None:
+            return None
+        result = self.stripe.refund(outcome.payment.reference, outcome.amount_micros, reason)
+        if not result.ok:
+            return None
+        txn = self.ledger.credit(
+            outcome.amount_micros, f"Refund: {reason}", rail=self.stripe.name, reference=result.reference
+        )
+        return txn.to_dict()
+
     def status(self) -> list[dict[str, Any]]:
         return [self.chain.status(), self.circle.status(), self.stripe.status()]

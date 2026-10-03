@@ -1,0 +1,19 @@
+# Never upload secrets or local state to Vercel (the CLI uploads the working directory).
+.env
+.env.*
+backend/.env
+backend/.env.*
+!backend/.env.example
+backend/data/
+*.db
+*.pem
+*.key
+
+# Not needed for the deployment
+node_modules/
+dist/
+tests/
+scripts/
+contracts/
+**/__pycache__/
+.pytest_cache/

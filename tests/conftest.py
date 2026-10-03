@@ -25,6 +25,7 @@ def make_settings(**overrides: Any) -> Settings:
         claude_fallbacks=False,
         initial_balance_usd=10.0,
         ledger_db_path="",
+        database_url="",
         spt_issuer_key="",
         demo_mode=True,
         stripe_secret_key="",
@@ -34,6 +35,9 @@ def make_settings(**overrides: Any) -> Settings:
         agent_wallet_private_key="",
         treasury_private_key="",
         crypto_mode="simulated",
+        demo_exchange_address="",
+        demo_stock_tokens={},
+        price_source="fixed",
         auto_topup_enabled=True,
         auto_topup_threshold_usd=1.0,
         auto_topup_amount_usd=5.0,
@@ -45,6 +49,9 @@ def make_settings(**overrides: Any) -> Settings:
         circle_token_id="",
         spt_signing_secret="test-secret-" + "x" * 32,
         spt_max_amount_usd=1.0,
+        search_provider="mock",
+        report_price_usd=0.75,
+        search_model="",
         brave_search_api_key="",
     )
     return replace(base, **overrides)
